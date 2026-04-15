@@ -1,0 +1,7 @@
+{
+  "tool_name": "Read",
+  "tool_input_preview": "{\"file_path\":\"/Users/wwj/Desktop/myself/claude-code-source-code/src/services/tools/toolErrors.ts\"}",
+  "error": "File does not exist. Note: your current working directory is /Users/wwj/Desktop/myself/claude-code-source-code.",
+  "timestamp": "2026-04-15T15:09:34.831Z",
+  "retry_count": 1
+}
