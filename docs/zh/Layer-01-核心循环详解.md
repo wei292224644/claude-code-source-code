@@ -72,6 +72,36 @@ type State = {
   turnCount: number                                      // 轮次计数器
   transition: Continue | undefined                       // 上一轮继续原因
 }
+
+### turnCount 与 maxTurns
+
+| 变量 | 性质 | 初始值 | 变化 |
+|-----|------|-------|------|
+| `turnCount` | 状态变量（会增长） | `1` | 每次递归 +1 |
+| `maxTurns` | 函数参数（固定配置） | 来自 `params.maxTurns` | **不增长** |
+
+**增长逻辑**（先检查后增长）：
+```typescript
+// 检查：下一轮会不会超过限制？
+if (maxTurns && nextTurnCount > maxTurns) {
+  return { reason: 'max_turns', turnCount: nextTurnCount }
+}
+
+// 然后才递增，进入下一轮
+const next: State = {
+  turnCount: turnCount + 1,  // ← 递增在检查之后
+  ...
+}
+```
+
+**示例**（maxTurns = 3）：
+```
+turnCount=1 → nextTurnCount=2 ≤ 3 → 继续执行
+turnCount=2 → nextTurnCount=3 ≤ 3 → 继续执行
+turnCount=3 → nextTurnCount=4 > 3 → 停止！返回 'max_turns'
+```
+
+**设计意图**：检查"下一轮会不会超限"而非"这一轮有没有超限"，确保 `turnCount=3` 时仍能执行。
 ```
 
 **设计意图**：所有可变状态集中在 `State` 结构体中，循环顶部统一解构。写入时使用 `state = { ... }` 而非单独赋值，保证状态一致性。
@@ -425,15 +455,25 @@ if (pendingMemoryPrefetch?.settledAt !== null &&
 }
 ```
 
-### 递归调用
+### maxTurns 检查与递归调用
 
 ```typescript
-// src/query.ts:1715-1727
+// src/query.ts:1704-1712 - maxTurns 检查
+if (maxTurns && nextTurnCount > maxTurns) {
+  yield createAttachmentMessage({
+    type: 'max_turns_reached',
+    maxTurns,
+    turnCount: nextTurnCount,
+  })
+  return { reason: 'max_turns', turnCount: nextTurnCount }
+}
+
+// src/query.ts:1715-1727 - 递归调用
 const next: State = {
   messages: [...messagesForQuery, ...assistantMessages, ...toolResults],
-  toolUseContext: toolUseContextWithQueryTracking,
+  toolUseContext: toolContextWithQueryTracking,
   autoCompactTracking: tracking,
-  turnCount: nextTurnCount,
+  turnCount: nextTurnCount,  // ← 每次 +1
   maxOutputTokensRecoveryCount: 0,
   hasAttemptedReactiveCompact: false,
   pendingToolUseSummary: nextPendingToolUseSummary,
@@ -444,6 +484,45 @@ const next: State = {
 state = next
 // 继续下一轮 while(true)
 ```
+
+**关键点**：
+- `nextTurnCount = turnCount + 1`（在循环内部计算）
+- 检查 `nextTurnCount > maxTurns` 后才执行 `state = next`
+- 中断时也会检查：`src/query.ts:1506-1514`
+
+### maxTurns 默认值与适用场景
+
+| 场景 | maxTurns 值 | 说明 |
+|-----|-----------|------|
+| **CLI 交互模式** | `undefined`（无限制） | 依赖用户主动中断（Ctrl+C） |
+| **CLI --print 模式** | 用户指定或 `undefined` | 程序化调用，需要显式限制 |
+| **extractMemories 子 Agent** | `5` | 记忆提取有内置限制 |
+| **compact 子 Agent** | `1` | 压缩只需一轮 |
+| **speculation 子 Agent** | `MAX_SPECULATION_TURNS` | 推测执行有限制 |
+| **SDK 模式** | 用户指定或 `undefined` | 程序化调用 |
+
+### 无限循环的防护机制
+
+主会话默认**不限制 turn 数**，但有其他机制防止真正的死循环：
+
+| 机制 | 作用 |
+|-----|------|
+| **API max_tokens 限制** | 模型输出有上限，不可能无限生成 |
+| **上下文压缩** | 当上下文太长时，触发 compact 压缩历史 |
+| **工具执行超时** | Bash 等工具本身有超时限制 |
+| **用户中断** | 交互模式下用户可随时 Ctrl+C |
+| **错误处理恢复** | API 错误、工具失败会触发恢复流程 |
+
+**真正的风险不是死循环，而是"上下文膨胀"**：
+```
+用户: "帮我重构整个项目"
+  → 模型不断调用工具（Read/Edit/Bash）
+  → 上下文越来越长 → compact 压缩
+  → 压缩后继续 → 模型"忘记"之前做了什么
+  → 可能做重复工作
+```
+
+**建议**：对于程序化调用（SDK / --print），始终设置合理的 `--max-turns` 限制，防止异常情况下的无限执行。
 
 ---
 
@@ -462,6 +541,7 @@ state = next
 | `'model_error'` | 模型运行时错误 | line 996 |
 | `'stop_hook_prevented'` | 停止钩子阻止继续 | line 1279 |
 | `'max_turns'` | 达到最大轮次限制 | line 1711 |
+| `max_turns_reached` | 附件消息类型，通知调用方已达到限制 | line 1706-1710 |
 | `'hook_stopped'` | 钩子停止了继续 | line 1520 |
 
 ---

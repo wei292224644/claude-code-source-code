@@ -70,6 +70,8 @@ Claude Code 采用**三层错误处理架构**：
 | **权限拒绝错误** | `toolExecution.ts:995+` | 工具使用被拒绝 |
 | **MCP 错误** | `mcp/client.ts` | MCP 服务器相关错误 |
 | **媒体大小错误** | `query.ts:1082+` | 图片/PDF 超出大小限制 |
+| **模型降级错误** | `withRetry.ts:160` | 529 过载触发模型降级（FallbackTriggeredError） |
+| **重试终止错误** | `withRetry.ts:144` | 标识不应再重试（CannotRetryError） |
 
 ### 2.2 API 错误分类 (`classifyAPIError`)
 
@@ -399,17 +401,53 @@ if (!withheld) { yield yieldMessage }
 
 ### 5.1 错误类定义
 
-**文件**: `src/utils/errors.ts`
+#### 核心错误类 (`src/utils/errors.ts`)
 
 | 类名 | 行号 | 用途 | 重试 |
 |------|------|------|------|
 | `ClaudeError` | 3-8 | 通用基础错误 | 否 |
 | `MalformedCommandError` | 10 | 命令格式错误 | 否 |
-| `AbortError` | 12-17 | 用户中断 | 否 |
+| `AbortError` | 12-17 | 用户中断（特殊处理，不记错误日志） | 否 |
 | `ConfigParseError` | 39-49 | 配置文件解析错误 | 否 |
-| `ShellError` | 51-61 | Shell 命令失败 | 否 |
+| `ShellError` | 51-61 | Shell 命令失败（带退出码） | 否 |
 | `TeleportOperationError` | 63-71 | 远程操作错误 | 否 |
 | `TelemetrySafeError` | 93-101 | 安全可记录到遥测的错误 | 否 |
+
+#### API 层错误类 (`src/services/api/withRetry.ts`)
+
+| 类名 | 行号 | 用途 | 重试 |
+|------|------|------|------|
+| `CannotRetryError` | 144-158 | 保存原始错误和重试上下文，标识"不应再重试" | 否 |
+| `FallbackTriggeredError` | 160-168 | 模型降级触发时抛出，切换模型整体重新跑 | 是（切换模型重试） |
+
+#### 媒体相关错误类 (`src/utils/`)
+
+| 类名 | 行号 | 用途 | 重试 |
+|------|------|------|------|
+| `ImageSizeError` | `imageValidation.ts:16` | 图片大小超限 | 否 |
+| `ImageResizeError` | `imageResizer.ts:37` | 图片调整失败 | 是（reactive compact） |
+| `MaxFileReadTokenExceededError` | `FileReadTool.ts:175` | 文件读取令牌超限 | 否 |
+| `FileTooLargeError` | `readFileInRange.ts:57` | 文件过大无法读取 | 否 |
+
+#### MCP 错误类 (`src/services/mcp/client.ts`)
+
+| 类名 | 行号 | 用途 | 重试 |
+|------|------|------|------|
+| `McpAuthError` | 152-159 | MCP 认证错误（HTTP 401 / OAuth token 过期） | 否（标记 needs-auth） |
+| `McpSessionExpiredError` | 165-170 | 会话过期（404/-32001 或 -32000 连接关闭） | 是（获取新会话） |
+| `McpToolCallError` | 177-186 | MCP 工具返回 `isError: true` | 否 |
+
+#### 工具执行相关错误类
+
+| 类名 | 位置 | 用途 | 重试 |
+|------|------|------|------|
+| `RipgrepTimeoutError` | `utils/ripgrep.ts:98` | ripgrep 命令超时 | 否 |
+| `DomainBlockedError` | `WebFetchTool/utils.ts:21` | WebFetch 域名被屏蔽 | 否 |
+| `EgressBlockedError` | `WebFetchTool/utils.ts:37` | WebFetch 出站流量被阻止 | 否 |
+| `CleanupTimeoutError` | `gracefulShutdown.ts:525` | 优雅关闭超时 | 否 |
+| `UltraplanPollError` | `ultraplan/ccrSession.ts:34` | Ultraplan 轮询错误 | 否 |
+| `StopTaskError` | `tasks/stopTask.ts:10` | 停止任务失败 | 否 |
+| `GcpCredentialsTimeoutError` | `auth.ts:2002` | GCP 凭证获取超时 | 否 |
 
 ### 5.2 错误格式化 (`formatError`)
 
@@ -491,7 +529,122 @@ return [{
 }]
 ```
 
-### 5.4 错误到遥测的分类 (`classifyToolError`)
+### 5.4 工具层面的两种错误返回模式
+
+工具（Tool）在错误返回机制上分为两种模式：
+
+#### 模式一：抛出异常（主要方式，约 95% 的工具使用）
+
+**适用场景**：工具执行过程中遇到的**预期内错误**（如文件不存在、权限拒绝、命令失败等）
+
+**工作流程**：
+
+```
+Tool.call() 执行
+    ↓
+抛出 Error / ShellError / 自定义异常
+    ↓
+toolExecution.ts 的 catch 块捕获（行 1589）
+    ↓
+创建 tool_result block，设置 is_error: true
+    ↓
+返回给 API/UI
+```
+
+**代码示例**：
+
+```typescript
+// BashTool.tsx:712-718
+if (result.preSpawnError) {
+  throw new Error(result.preSpawnError);  // 预检错误
+}
+if (interpretationResult.isError && !isInterrupt) {
+  throw new ShellError('', outputWithSbFailures, result.code, result.interrupted);
+}
+
+// FileReadTool.ts:647
+if (!fileExists) {
+  throw new Error(`File not found: ${filePath}`);
+}
+```
+
+**特点**：
+- 所有 Tool 都使用这种方式处理执行时错误
+- 错误信息统一通过 `is_error: true` 标记
+- 错误格式：`<tool_use_error>Error: 具体信息</tool_use_error>`
+
+---
+
+#### 模式二：通过 `mapToolResultToToolResultBlockParam` 返回错误标记（辅助方式，约 5% 的工具使用）
+
+**适用场景**：工具正常执行完成，但结果本身包含错误信息（**结果层面的错误**，而非执行层面的异常）
+
+**工作流程**：
+
+```
+Tool.call() 执行完成
+    ↓
+返回 ToolResult { data: {...} }
+    ↓
+调用 mapToolResultToToolResultBlockParam()
+    ↓
+在返回结果中检查 error 字段并设置 is_error: true
+    ↓
+返回给 API/UI
+```
+
+**代码示例**：
+
+```typescript
+// NotebookEditTool.ts:133-144
+mapToolResultToToolResultBlockParam(
+  { cell_id, edit_mode, new_source, error },
+  toolUseID
+) {
+  if (error) {
+    return {
+      tool_use_id: toolUseID,
+      type: 'tool_result',
+      content: error,      // 错误信息
+      is_error: true,      // 标记为错误
+    };
+  }
+  // 正常结果...
+}
+
+// ConfigTool.ts:427-432
+return {
+  tool_use_id: toolUseID,
+  type: 'tool_result',
+  content: `Error: ${content.error}`,
+  is_error: true,
+}
+```
+
+**特点**：
+- 仅用于"执行流程正常结束，但结果本身包含错误信息"的场景
+- 例如 `NotebookEditTool` 的 `error` 字段表示编辑失败，但整个调用流程是正常的
+- 工具自己判断结果中的 `error` 字段，在 `mapToolResultToToolResultBlockParam` 中直接返回 `is_error: true`
+
+---
+
+#### 两种模式对比
+
+| 特性 | 模式一：抛出异常 | 模式二：mapToolResultToToolResultBlockParam |
+|------|-----------------|---------------------------------------------|
+| **使用频率** | 约 95% 的工具 | 约 5% 的工具 |
+| **典型场景** | 文件不存在、权限拒绝、命令失败 | 执行完成但结果含错误（如 NotebookEdit error 字段） |
+| **错误检测位置** | `toolExecution.ts` catch 块（行 1589） | Tool 的 `mapToolResultToToolResultBlockParam` 方法 |
+| **处理方式** | `throw new Error()` | 在结果中返回 `{ is_error: true }` |
+| **示例 Tool** | BashTool, FileReadTool, AgentTool 等 | NotebookEditTool, ConfigTool |
+| **is_error 设置位置** | `toolExecution.ts:1722` | Tool 的 `mapToolResultToToolResultBlockParam` 方法内 |
+
+**核心原则**：
+- **大多数错误**通过抛出异常由 `toolExecution.ts` 统一处理
+- **`is_error: true`** 仅用于"执行流程正常结束，但结果本身是错误"的特殊情况
+- 两种模式最终都返回 `is_error: true` 的 `tool_result` 块，差异仅在于设置错误标记的位置
+
+### 5.5 错误到遥测的分类 (`classifyToolError`)
 
 **文件**: `src/services/tools/toolExecution.ts:150-171`
 
