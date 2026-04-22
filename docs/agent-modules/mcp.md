@@ -1256,7 +1256,280 @@ src/services/mcp/
 
 ---
 
-## 11. 环境变量
+## 12. 连接生命周期管理
+
+> **重要：修复了原始设计中缺少运行时连接生命周期管理的问题。**
+
+### 12.1 完整状态机
+
+```
+                    ┌──────────────┐
+                    │   Disabled   │ (配置中已禁用)
+                    └──────┬───────┘
+                           │ enable()
+                           ▼
+              ┌────────────────────────┐
+              │    Connecting          │◄── retry after failure
+              │  (正在建立连接)         │    exponential backoff
+              └────────┬───────────────┘
+                       │ connected OK
+                       ▼
+              ┌────────────────────────┐
+              │    Connected           │ ◀ 正常运行态
+              │  (连接就绪，可调用工具)   │
+              └────────┬───────────────┘
+                       │ disconnect / error
+                       ▼
+              ┌────────────────────────┐
+              │   Disconnecting        │
+              │  (优雅关闭中)           │
+              └────────┬───────────────┘
+                       │ closed
+                       ▼
+              ┌────────────────────────┐
+              │    Disconnected        │
+              │  (连接已关闭)           │
+              └────────────────────────┘
+```
+
+### 12.2 连接重建策略
+
+SSE 和 HTTP transport 的网络中断需要自动重连：
+
+```python
+import asyncio
+import random
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ReconnectConfig:
+    max_retries: int = 5
+    initial_delay_ms: int = 1000
+    max_delay_ms: int = 60000
+    jitter: bool = True
+
+
+class MCPConnectionManager:
+    """
+    MCP 连接管理器。
+    
+    职责：
+    1. 连接建立、维持、断开
+    2. 断线自动重连（含指数退避）
+    3. 连接健康检查（定期 ping）
+    4. 并发工具调用的排队与拒绝策略
+    """
+
+    def __init__(self, config: MCPServerConfig, reconnect_config: ReconnectConfig | None = None):
+        self.config = config
+        self.reconnect_config = reconnect_config or ReconnectConfig()
+        self._client: Optional[MCPClient] = None
+        self._status: str = "disconnected"
+        self._reconnect_task: asyncio.Task | None = None
+        self._health_check_task: asyncio.Task | None = None
+        self._pending_tool_calls: list[tuple[str, dict]] = []  # 连接断开时的等待队列
+        self._lock = asyncio.Lock()
+
+    async def connect(self) -> dict:
+        """建立连接"""
+        async with self._lock:
+            self._status = "connecting"
+            try:
+                self._client = MCPClient(self.config)
+                capabilities = await asyncio.wait_for(
+                    self._client.connect(),
+                    timeout=30.0,
+                )
+                self._status = "connected"
+                # 启动后台维护任务
+                self._health_check_task = asyncio.create_task(self._periodic_health_check())
+                return capabilities
+            except Exception as e:
+                self._status = f"failed: {e}"
+                raise
+
+    async def _periodic_health_check(self) -> None:
+        """
+        每 60 秒检查一次连接是否存活。
+        
+        对于 stdio transport，通过发送一个空 tools/call 来检测子进程是否还活着。
+        对于 HTTP/SSE，通过简单的 RPC ping 检测。
+        """
+        interval = 60  # seconds
+        while self._status == "connected":
+            await asyncio.sleep(interval)
+            try:
+                if self._client:
+                    await asyncio.wait_for(
+                        self._client.call_tool("_health_ping", {}),
+                        timeout=5.0,
+                    )
+            except (asyncio.TimeoutError, Exception):
+                # 连接可能已死，触发重连
+                self._status = "connecting"
+                asyncio.create_task(self._reconnect_with_backoff())
+
+    async def _reconnect_with_backoff(self) -> None:
+        """指数退避重连"""
+        config = self.reconnect_config
+        for attempt in range(config.max_retries):
+            delay = min(
+                config.initial_delay_ms * (2.0 ** attempt),
+                config.max_delay_ms,
+            )
+            if config.jitter:
+                delay = delay * (0.5 + random.random())
+
+            self._status = f"reconnecting (attempt {attempt + 1}/{config.max_retries})"
+            await asyncio.sleep(delay / 1000)
+
+            try:
+                if self._client:
+                    await self._client.disconnect()
+            except Exception:
+                pass  # 忽略断连失败
+
+            try:
+                self._client = MCPClient(self.config)
+                await self._client.connect()
+                self._status = "connected"
+                self._health_check_task = asyncio.create_task(
+                    self._periodic_health_check()
+                )
+                # 重连成功后处理等待队列
+                await self._drain_pending_queue()
+                return
+            except Exception:
+                continue
+
+        self._status = "permanently_failed"
+
+    async def call_tool_safe(
+        self, tool_name: str, args: dict
+    ) -> dict:
+        """
+        安全调用工具，连接断开时进入等待队列而非立即失败。
+        """
+        async with self._lock:
+            if self._status == "connected" and self._client:
+                return await self._client.call_tool(tool_name, args)
+
+            if self._status.startswith("reconnecting"):
+                # 加入等待队列，由重连完成后的 drain 处理
+                future = asyncio.get_event_loop().create_future()
+                self._pending_tool_calls.append((tool_name, args))
+                # TODO: 将 future 挂到 drain 逻辑上
+                raise MCPConnectionUnavailable(
+                    f"Reconnecting, will retry after recovery"
+                )
+
+            raise MCPConnectionUnavailable(
+                f"Connection is {self._status}"
+            )
+
+    async def _drain_pending_queue(self) -> None:
+        """重连后处理等待中的工具调用"""
+        calls = self._pending_tool_calls
+        self._pending_tool_calls = []
+        for tool_name, args in calls:
+            try:
+                if self._client:
+                    await self._client.call_tool(tool_name, args)
+            except Exception as e:
+                # 记录失败但不抛出，避免影响其他调用
+                print(f"[MCP] Failed pending call {tool_name}: {e}")
+
+    async def disconnect(self) -> None:
+        """优雅关闭"""
+        self._status = "disconnecting"
+        if self._health_check_task:
+            self._health_check_task.cancel()
+        if self._client:
+            await self._client.disconnect()
+        self._status = "disconnected"
+```
+
+### 12.3 OAuth Token 刷新流程
+
+```python
+async def handle_oauth_401_error(client: MCPClient) -> bool:
+    """
+    当收到 401 响应时触发 token 刷新。
+    
+    流程：
+    1. 捕获 HTTP 401 响应
+    2. 使用 refresh_token 调用 OAuth provider 获取新 access_token
+    3. 更新 client 的 Authorization header
+    4. 重试失败的请求
+    """
+    provider = get_oauth_provider(client.server_name)
+    tokens = provider.get_tokens()
+
+    if not tokens.refresh_token:
+        # 无 refresh token，需要用户重新认证
+        trigger_user_auth_flow(client.server_name)
+        return False
+
+    try:
+        new_tokens = await provider.refresh_token(tokens.refresh_token)
+        provider.store_tokens(new_tokens)
+        client.update_auth_header(new_tokens.access_token)
+        return True
+    except Exception as e:
+        # refresh 也失败，清除本地存储的 token
+        provider.clear_tokens()
+        trigger_user_auth_flow(client.server_name)
+        return False
+```
+
+### 12.4 stdio 子进程管理
+
+```python
+class StdioTransport:
+    """
+    STDIO Transport 的特殊考量。
+    
+    子进程可能因为以下原因退出：
+    1. 正常退出（不应发生，MCP server 应持续运行）
+    2. crash / segfault
+    3. 被 kill signal 终止
+    4. OOM killer
+    """
+
+    async def start(self) -> None:
+        self._process = await asyncio.create_subprocess_exec(
+            self.command,
+            *self.args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        # 监控子进程退出
+        self._monitor_task = asyncio.create_task(self._monitor_process())
+
+    async def _monitor_process(self) -> None:
+        """后台监控子进程是否还在运行"""
+        while True:
+            retcode = self._process.returncode
+            if retcode is not None:
+                # 子进程已退出
+                if retcode != 0:
+                    stderr_output = await self._process.stderr.read()
+                    log_event(
+                        "mcp_stdio_process_exited",
+                        code=retcode,
+                        stderr=stderr_output[:500],
+                    )
+                # 触发重连逻辑
+                await self.connection_manager._reconnect_with_backoff()
+                return
+            await asyncio.sleep(2)  # 每 2 秒检查一次
+```
+
+---
+
+## 13. 环境变量
 
 | 变量名 | 默认值 | 描述 |
 |--------|--------|------|

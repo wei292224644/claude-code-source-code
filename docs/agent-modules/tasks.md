@@ -934,7 +934,138 @@ const results = await Promise.all(subagentPromises)
 
 ---
 
-## 9. 源码索引
+## 9. 统一抽象层设计（Python 端口需补充）
+
+三种执行模式（LocalAgent / RemoteAgent / InProcessTeammate）当前各自维护独立的状态结构和结果格式，Python 端口需要建立统一的抽象屏障。
+
+### 9.1 统一结果接口
+
+无论哪种执行模式，最终都应返回一致的 `TaskResult`：
+
+```python
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+class TaskStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    KILLED = "killed"
+
+@dataclass(frozen=True)
+class TaskResult:
+    """所有任务类型的统一结果格式"""
+    task_id: str
+    status: TaskStatus
+    output: str                          # 文本输出（失败时为空）
+    error: Optional[str]                 # 错误信息（成功时为 None）
+    success: bool                        # status in (COMPLETED,) → True
+    usage: Optional[TaskUsage]           # token/tool 消耗统计
+    duration_ms: int                     # 执行时长
+
+@dataclass(frozen=True)
+class TaskUsage:
+    tool_uses: int
+    total_tokens: int
+    duration_ms: int
+```
+
+对比当前三种模式的差异：
+
+| 维度 | LocalAgent | RemoteAgent | InProcessTeammate |
+|------|-----------|-------------|-------------------|
+| 结果类型 | `AgentToolResult` | SDK raw message | `AgentToolResult` |
+| 错误表示 | `error: string` | exception from HTTP poll | `error?: string` |
+| 进度上报 | `AgentProgress` | event stream fragment | `AgentProgress` |
+| 取消机制 | `AbortController` | session cancel API | `AbortController` + `shutdownRequested` |
+
+统一后，主循环只需处理 `TaskResult` 一个类型，无需针对每种任务做分支。
+
+### 9.2 统一错误处理策略
+
+| 错误类别 | LocalAgent | RemoteAgent | InProcessTeammate | 统一后行为 |
+|---------|-----------|-------------|-------------------|-----------|
+| 超时 | 无显式超时 | HTTP request timeout | 无显式超时 | 统一通过 `task_timeout_seconds` 配置项控制，超时时 status→FAILED，error="timeout" |
+| Budget 耗尽 | 无检查 | 无检查 | 无检查 | 在轮询回调中检查预算，接近上限时 status→KILLED，error="budget_exceeded" |
+| 进程崩溃 | subprocess exit code ≠ 0 | HTTP 5xx | Python uncaught exception | 全部映射为 status→FAILED，error=规范化错误消息 |
+| 权限拒绝 | Permission denied prompt | N/A | N/A | 仅 LocalAgent/InProcess 可能出现，统一映射为 status→FAILED |
+
+**推荐实现：** 定义一个 `TaskError` 枚举类，将各类底层异常统一翻译为标准错误码：
+
+```python
+class TaskErrorType(Enum):
+    TIMEOUT = "timeout"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    PERMISSION_DENIED = "permission_denied"
+    REMOTE_UNAVAILABLE = "remote_unavailable"
+    LOCAL_CRASH = "local_crash"
+
+def normalize_error(exception: Exception, context: TaskContext) -> TaskResult:
+    """将所有异常统一映射为 TaskResult(status=FAILED)"""
+    if isinstance(exception, TimeoutError):
+        return TaskResult(..., status=TaskStatus.FAILED, error_type=TaskErrorType.TIMEOUT)
+    if isinstance(exception, BudgetExceededError):
+        return TaskResult(..., status=TaskStatus.FAILED, error_type=TaskErrorType.BUDGET_EXCEEDED)
+    # ...
+```
+
+### 9.3 RemoteAgent 轮询容错设计
+
+RemoteAgent 依赖 HTTP 轮询获取云端结果，需要完善的容错策略：
+
+| 场景 | 当前行为 | 建议改进 |
+|------|---------|---------|
+| HTTP 5xx 瞬时错误 | 可能直接抛异常 | 指数退避重试（1s, 2s, 4s, 8s），最多 5 次 |
+| 网络断开 > 30s | 未定义 | 标记 task 为半完成状态，后台保持轮询连接 |
+| Claude.ai 服务不可用 | 无降级 | 自动切换到 "Local Mode"——在本地运行相同 prompt，使用相同的 Agent definition |
+| 远程会话被服务端清理 | poll 返回空 | 触发 `completion_checker` 二次确认，确认后 status→FAILED |
+| Token budget 接近上限 | 无检查 | 每轮轮询前检查 `cost_tracker.remaining_budget()`，< $0.50 时发送警告，< $0.10 时主动 abort |
+
+**轮询重试伪代码：**
+
+```python
+async def poll_with_backoff(session, url, max_retries=5):
+    delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            resp = await session.get(url, timeout=10)
+            if resp.status == 200:
+                return await resp.json()
+            if resp.status >= 500:
+                await asyncio.sleep(delay)
+                delay *= 2  # 指数退避
+                continue
+            raise RemotePollError(f"HTTP {resp.status}")
+        except aiohttp.ClientConnectionError:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                raise
+    raise RemotePollError(f"Failed after {max_retries} retries")
+```
+
+### 9.4 LocalAgent 独立状态同步
+
+LocalAgent 在主事件循环之外独立运行，其状态同步到主 loop 的机制需要明确：
+
+| 同步通道 | 方向 | 频率 | 内容 |
+|---------|------|------|------|
+| `outputFile` (symlink) | Agent → Main | 写入追加 | 子代理的工具调用结果 |
+| `updateTaskState(updater)` | Main → Agent state store | 每次工具调用 | progress, tool_use_count, token_count |
+| `emitTaskProgress()` | Agent → SDK consumer | 周期性（~5s） | summary, recent_activities |
+| `AbortController` | Main → Agent | 按需 | 取消信号 |
+
+**关键设计约束：**
+1. LocalAgent 的 `readFileState` 必须是主状态的浅克隆（shallow clone），修改文件后不反向同步到主状态，避免写冲突
+2. 状态更新必须通过 `setAppState(prev => updated)` 不可变模式，禁止直接修改 `prev.tasks[taskId]`
+3. `outputFile` 读取必须基于 `outputOffset` 增量读取，防止重复消费
+
+---
+
+## 10. 源码索引
 
 | 组件 | 文件路径 |
 |------|----------|

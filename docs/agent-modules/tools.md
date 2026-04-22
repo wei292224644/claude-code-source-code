@@ -1820,7 +1820,154 @@ is_error=True 传递到 ToolResultBlock
 
 ## 7. 扩展新 Tool 的模式
 
-### 7.1 按照 `build_tool` 模式添加新工具的步骤
+### 7.1 Build Tool 参数设计改进建议
+
+> **重要：`build_tool()` 有 30+ 可选参数（mirrors TypeScript TOOL_DEFAULTS），这在 Python 中比 TypeScript 更危险**——Python 没有类型检查编译器来 catch 参数名错误。以下为推荐改进方案。
+
+#### 方案 A：Builder Pattern（推荐）
+
+```python
+# tools/factory.py — 使用 builder pattern 替代 flat params
+
+class ToolBuilder:
+    """构建 Tool 的流式 API"""
+
+    def __init__(self, name: str, input_schema: type[BaseModel]) -> None:
+        self._name = name
+        self._input_schema = input_schema
+        self._call: Callable | None = None
+        self._description: str | Callable | None = None
+        self._max_result_size_chars: int = 100_000
+        self._is_read_only: Callable[[dict], bool] | None = None
+        self._is_destructive: Callable[[dict], bool] | None = None
+        self._validate_input: Callable | None = None
+        self._is_concurrency_safe: Callable[[dict], bool] | None = None
+        # ... 其余字段延迟设置
+
+    def call(self, handler: Callable) -> "ToolBuilder":
+        self._call = handler
+        return self
+
+    def description(self, desc: str | Callable) -> "ToolBuilder":
+        self._description = desc
+        return self
+
+    def max_result_size(self, chars: int) -> "ToolBuilder":
+        self._max_result_size_chars = chars
+        return self
+
+    def read_only(self, fn: Callable[[dict], bool] | bool = True) -> "ToolBuilder":
+        if isinstance(fn, bool):
+            self._is_read_only = lambda _: fn
+        else:
+            self._is_read_only = fn
+        return self
+
+    def destructive(self, fn: Callable[[dict], bool]) -> "ToolBuilder":
+        self._is_destructive = fn
+        return self
+
+    def validate(self, fn: Callable) -> "ToolBuilder":
+        self._validate_input = fn
+        return self
+
+    def concurrency_safe(self, fn: Callable[[dict], bool]) -> "ToolBuilder":
+        self._is_concurrency_safe = fn
+        return self
+
+    def build(self) -> ToolProtocol:
+        """最终构建，验证必要字段完整性"""
+        if self._call is None:
+            raise ToolDefError("Tool must have a 'call' handler")
+        if not self._name:
+            raise ToolDefError("Tool must have a 'name'")
+        return build_tool(
+            name=self._name,
+            input_schema=self._input_schema,
+            call=self._call,  # type: ignore
+            description=self._description,
+            max_result_size_chars=self._max_result_size_chars,
+            is_read_only=self._is_read_only,
+            is_destructive=self._is_destructive,
+            validate_input=self._validate_input,
+            is_concurrency_safe=self._is_concurrency_safe,
+        )
+
+
+# 使用示例
+MyTool = (
+    ToolBuilder("my_tool", MyToolInput)
+    .description(lambda i: f"MyTool: {i.get('action')}")
+    .read_only(lambda i: i.get("action") == "read")
+    .destructive(lambda i: i.get("action") == "delete")
+    .validate(my_tool_validate)
+    .concurrency_safe(lambda i: i.get("action") == "read")
+    .call(my_tool_handler)
+    .build()
+)
+```
+
+#### 方案 B：分组 Config Dict（次选）
+
+```python
+# 将相关参数分组为 config dict，减少函数签名宽度
+
+@dataclass(frozen=True)
+class ToolConfig:
+    """Tool 配置分组"""
+    behavior: "BehaviorConfig" = field(default_factory=BehaviorConfig)
+    validation: "ValidationConfig" = field(default_factory=ValidationConfig)
+    presentation: "PresentationConfig" = field(default_factory=PresentationConfig)
+
+
+@dataclass(frozen=True)
+class BehaviorConfig:
+    is_read_only: Callable[[dict], bool] = lambda _: False
+    is_destructive: Callable[[dict], bool] = lambda _: False
+    is_concurrency_safe: Callable[[dict], bool] = lambda _: False
+    check_permissions: Callable | None = None
+
+
+@dataclass(frozen=True)
+class ValidationConfig:
+    validate_input: Callable | None = None
+
+
+@dataclass(frozen=True)
+class PresentationConfig:
+    description: str | Callable | None = None
+    user_facing_name: Callable | None = None
+
+
+# build_tool 调用简化为
+WebFetchTool = build_tool(
+    name="web_fetch",
+    input_schema=WebFetchInput,
+    call=web_fetch_handler,
+    config=ToolConfig(
+        behavior=BehaviorConfig(
+            is_read_only=lambda _: True,
+            is_concurrency_safe=lambda _: True,
+        ),
+        validation=ValidationConfig(validate_input=web_fetch_validate_input),
+        presentation=PresentationConfig(
+            description=lambda i: f"Fetching {i.get('url')}",
+        ),
+    ),
+)
+```
+
+#### 对比
+
+| 维度 | Flat params (当前) | Builder | Config dict |
+|------|-------------------|---------|-------------|
+| 函数签名宽度 | 30+ 参数 | 仅 `build()` | ~5 个分组 |
+| IDE 自动补全 | 需要滚动 | 链式调用提示 | 每组独立提示 |
+| 必填校验 | 运行时才知道 | build() 时明确报错 | 同上 |
+| 可读性 | 命名参数长且多 | 流畅接口 | 结构清晰 |
+| 迁移成本 | - | 中等 | 低 |
+
+### 7.2 按照 `build_tool` 模式添加新工具的步骤
 
 **Step 1: 定义输入 Schema（Pydantic Model）**
 

@@ -176,6 +176,79 @@ if (loadedFrom !== 'mcp') {
 
 ---
 
+## 1.5 Inline Shell 安全模型增强设计（Python 端口需补充）
+
+Python 端口在复现 inline shell 执行机制时，需要建立完整的安全约束体系，而不仅仅是简单的 `loadedFrom != 'mcp'` 判断。
+
+### 1.5.1 Shell 白名单与命令过滤
+
+SKILL.md 中可以声明 shell 命令，但必须经过两层验证：
+
+| 层级 | 检查项 | 失败行为 |
+|------|--------|----------|
+| **解析期** | 检测 `$ARGUMENTS`, `${CLAUDE_SESSION_ID}` 等变量替换后的最终文本中是否包含 `!` 前缀 | 仅标记为待执行，不影响 Skill 加载 |
+| **执行期** | ① 源类型检查（MCP source 直接拒绝）；② 命令哈希校验（是否在 `allowedCommands` 白名单）；③ glob 路径匹配安全（防止 `..` 穿越） | 任一检查失败 → 抛出 `ShellExecutionForbiddenError`，记录 audit log |
+
+**推荐实现伪代码：**
+
+```python
+class ShellSecurityPolicy:
+    """Inline shell 执行安全策略"""
+
+    def validate(self, skill: Skill, command: str, context: ToolContext) -> bool:
+        # 1. 源类型强制检查（铁律）
+        if skill.source in ('mcp', 'remote'):
+            raise ShellExecutionForbiddenError(
+                f"MCP/remote skill '{skill.name}' cannot execute shell commands"
+            )
+
+        # 2. 环境变量注入隔离 — 禁止访问敏感环境变量
+        forbidden_env = {'AWS_SECRET_ACCESS_KEY', 'GITHUB_TOKEN', 'ANTHROPIC_API_KEY'}
+        injected_vars = self._extract_env_refs(command)
+        if injected_vars & forbidden_env:
+            raise ShellExecutionForbiddenError(
+                f"Command references forbidden env vars: {injected_vars}"
+            )
+
+        # 3. 命令白名单（可选模式）
+        if context.require_whitelist:
+            if command not in skill.metadata.allowed_commands:
+                raise ShellExecutionForbiddenError(
+                    f"Command '{command}' not in allowed list"
+                )
+
+        return True
+```
+
+### 1.5.2 glob 路径匹配安全
+
+`paths` 字段的 gitignore 风格匹配存在路径穿越风险，需要防御：
+
+| 攻击向量 | 防护手段 |
+|---------|---------|
+| `../` 穿越到项目根目录以外 | 匹配前用 `os.path.realpath()` 规范化路径，确认仍在 cwd 内 |
+| `.gitignore` 中的 `!` negation 规则被绕过 | 使用 `pathspec` 库的标准实现，不自行解析 |
+| Unicode 混淆（如 `ｃｏｄｅ` vs `code`） | 统一 NFKC 归一化后再匹配（`unicodedata.normalize('NFKC', path)`） |
+
+### 1.5.3 Audit Log 要求
+
+所有 inline shell 执行必须写入审计日志：
+
+```json
+{
+  "event": "shell_execution",
+  "skill_name": "simplify",
+  "source": "userSettings",
+  "command": "prettier --write src/**/*.ts",
+  "working_dir": "/home/user/project",
+  "allowed_tools_applied": ["Bash", "Read", "Edit"],
+  "timestamp": "2026-04-22T10:30:00Z",
+  "exit_code": 0
+}
+```
+
+---
+
 ## 2. Skill 数据模型（TypeScript）
 
 ### 2.1 Command 类型层次

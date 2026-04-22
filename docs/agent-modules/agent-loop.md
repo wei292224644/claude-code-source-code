@@ -1960,23 +1960,193 @@ async def example_tool_handler(
 
 ---
 
-## 附录 A: 与 TypeScript 实现的映射关系
+## 9. Concurrency Model
 
-| TypeScript (src/query.ts) | Python (agent/) | 说明 |
-|---------------------------|-----------------|------|
-| `query()` | `run_agent_loop()` | 主循环函数 |
-| `QueryEngine.submitMessage()` | `QueryEngine.submit_message()` | SDK 调用封装 |
-| `while(true)` | `while True` | 主循环 |
-| `State` | `LoopState` | 循环状态 |
-| `QueryEngineConfig` | `QueryEngineConfig` | 配置类 |
-| `toolUseBlocks` | `ToolUseBlock` | tool_use 块 |
-| `canUseTool` | - | 权限钩子（简化实现） |
-| `stop_reason` | `stop_reason` | 停止原因 |
-| `message_delta` | SDK event | 流式事件 |
+### 9.1 asyncio vs threading 边界
 
-## 附录 B: 参考文件
+Python 的 `asyncio` 是单线程事件循环模型，而 `Store` 使用 `threading.RLock`。这两者的关系必须明确：
 
-- 源实现：`src/query.ts`
-- SDK 封装：`src/QueryEngine.ts`
-- Tool 接口：`src/Tool.ts`
-- 架构概览：`docs/agent-architecture.md`
+| 操作类型 | 执行位置 | 原因 |
+|----------|----------|------|
+| LLM API 调用 (`acompletion`) | event loop | 纯 async I/O，不阻塞 |
+| Tool handler（网络请求） | event loop | httpx.AsyncClient，不阻塞 |
+| File read/write | **thread pool** (`run_in_executor`) | `open()` 是同步阻塞操作 |
+| Shell command execution | **process pool** or subprocess | `subprocess.run()` 会阻塞事件循环 |
+| Store state update | event loop | `RLock` 在 asyncio 中仅防意外跨线程访问，同线程内不需要 |
+| Token counting (tiktoken) | **thread pool** | CPU-bound 计算会阻塞事件循环 |
+
+**关键规则：**
+- 任何可能阻塞的事件循环线程的操作必须用 `asyncio.get_event_loop().run_in_executor(None, blocking_fn)` 包装
+- `RLock` 在同线程（纯 asyncio）场景下不是必需的，但如果代码路径涉及 `run_in_executor` 回调修改 store，则 RLock 保护有意义
+- 不要在 `execute_tool_safe` 或任何 handler 中直接调用同步 I/O
+
+### 9.2 资源清理路径
+
+`run_agent_loop` 是一个 async generator，存在三种退出路径，每种都需要清理：
+
+```python
+@contextlib.asynccontextmanager
+async def run_agent_loop_managed(...):
+    """带资源管理的 agent loop 包装器"""
+    engine = None
+    mcp_clients_to_cleanup = []
+    
+    try:
+        async for event in run_agent_loop(initial_messages, config):
+            yield event
+        
+        # return 正常结束
+        log_event("loop_completed", ...)
+    except asyncio.CancelledError:
+        # 用户中断
+        log_event("loop_interrupted", ...)
+        raise  # 重新抛出，不让 caller 以为是普通完成
+    except Exception as e:
+        # 未捕获异常
+        log_event("loop_error", error=str(e), ...)
+        raise
+    finally:
+        # 无论哪种退出路径都要执行的清理
+        if engine:
+            await engine.cleanup()
+        for client in mcp_clients_to_cleanup:
+            await client.disconnect()
+        # 取消所有运行中的子任务
+        for task in asyncio.all_tasks():
+            if task is not asyncio.current_task():
+                task.cancel()
+```
+
+**内存泄漏防护清单：**
+1. `QueryEngine` 持有的 httpx client 需要显式 `aclose()`
+2. 子 agent 的 `AbortController` 需要在父任务结束时 cancel
+3. `Store._listeners` 集合中的 listener 引用需要在取消订阅后移除（已有此逻辑）
+4. 长会话中的 messages 列表需要受 `max_history` 限制，无上限增长会导致 OOM
+
+---
+
+## 10. Token Budget 详细实现
+
+### 10.1 Budget 粒度
+
+Budget 控制分为两个层级：
+
+| 层级 | 变量 | 范围 | 说明 |
+|------|------|------|------|
+| per-query | `task_budget` | 单次 query() 调用 | LiteLLM 内部预算，用于单次 API 调用的 token 上限 |
+| cross-session | `max_budget_usd` | 整个对话生命周期 | 累计所有轮次的费用，达到后终止 loop |
+
+### 10.2 费用计算
+
+```python
+def estimate_cost(usage: dict, model_name: str) -> float:
+    """
+    根据 usage 和模型名称估算费用。
+    
+    价格数据来源: https://www.anthropic.com/pricing 等 provider 文档
+    实际实现应从配置或远程价格表加载。
+    """
+    pricing = {
+        "anthropic/claude-sonnet-4-20250514": {
+            "input": 3.0e-6,       # $3/1M tokens
+            "output": 15.0e-6,     # $15/1M tokens
+            "cache_read": 0.3e-6,  # $0.30/1M cache reads
+            "cache_creation": 3.75e-6,  # $3.75/1M cache writes
+        },
+        "anthropic/claude-opus-4-20250514": {
+            "input": 15.0e-6,
+            "output": 75.0e-6,
+            "cache_read": 1.5e-6,
+            "cache_creation": 18.75e-6,
+        },
+    }
+    
+    prices = pricing.get(model_name, pricing["anthropic/claude-sonnet-4-20250514"])
+    
+    cost = (
+        usage.get("cache_read_input_tokens", 0) * prices["cache_read"]
+        + usage.get("cache_creation_input_tokens", 0) * prices["cache_creation"]
+        + usage.get("input_tokens", 0) * prices["input"]
+        + usage.get("output_tokens", 0) * prices["output"]
+    )
+    
+    return cost
+
+
+def check_budget_exceeded(
+    total_usage: dict,
+    model_name: str,
+    max_budget_usd: float,
+) -> bool:
+    """检查是否超出预算"""
+    return estimate_cost(total_usage, model_name) >= max_budget_usd
+```
+
+### 10.3 超预算时的行为
+
+- **不应静默停止**：向 LLM 注入一条 SystemMessage(subtype="budget_warning")，提示剩余预算极少
+- **下一轮开始前严格检查**：每轮循环开头在 `_prepare_messages_for_query` 之后、`submit_message` 之前调用 `check_budget_exceeded`
+- **返回明确的 SystemMessage**：`SystemMessage(subtype="max_budget_reached", content="Budget exhausted. Final summary.")` 然后 `return None`
+
+---
+
+## 11. 可观测性设计
+
+Agent loop 是一个长期运行的黑盒，缺少可观测性意味着线上无法排查问题。最小化可观测性要求：
+
+### 11.1 结构化日志
+
+```python
+import logging
+
+logger = logging.getLogger("agent.loop")
+
+# 每个关键事件记录一条结构化日志
+logger.info("loop_started", turn=0, model=config.model.name, tools=len(config.tools))
+logger.info("llm_response_received", turn=turn, stop_reason=stop_reason, 
+            input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"])
+logger.info("tool_executed", tool_name=block.name, duration_ms=duration_ms, is_error=is_error)
+logger.warning("api_error_retry", turn=turn, error_type=error_type, attempt=attempt)
+logger.info("loop_completed", total_turns=turn_count, total_cost=total_cost)
+```
+
+### 11.2 Metrics
+
+至少暴露以下指标给监控系统（Prometheus/OpenTelemetry）：
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `agent_turn_total` | Counter | status="completed"/"failed"/"budget_exceeded" |
+| `agent_token_count` | Histogram | label="input"|"output"|"cache_read"|"cache_creation" |
+| `agent_tool_call_duration_ms` | Histogram | label="tool_name" |
+| `agent_api_error_count` | Counter | label="error_type"="rate_limit"/"timeout"/"other" |
+| `agent_budget_remaining_usd` | Gauge | - |
+
+### 11.3 Tracing
+
+每次 `QueryEngine.submit_message()` 产生一个 span：
+
+```
+span: submit_message
+├── attributes: model, turn_count, message_count
+├── events: [token_usage, stop_reason]
+└── children:
+    ├── tool_call(web_fetch): 234ms
+    ├── tool_call(bash): 12ms
+    └── tool_call(agent): 45000ms
+```
+
+---
+
+## 12. 降级策略
+
+当 LLM API 不可用时，CLI 应给出有意义的行为而非崩溃：
+
+| 故障场景 | 降级行为 |
+|----------|---------|
+| 速率限制（429） | 指数退避重试（已有），超过 max_retries 后向用户显示等待时间 |
+| API 完全宕机 | 通知用户 "API unavailable"，进入本地模式（仅可用 bash/read/edit 等无依赖工具） |
+| 网络超时 | 重试后失败，建议检查代理设置 |
+| 认证失效（401） | 触发 re-auth 流程，阻止继续调用 |
+
+**本地模式（Local Mode）**：当 API 连续 N 次失败后自动切换，允许用户使用非 AI 工具（文件操作、shell）工作，API 恢复后无缝切回。
