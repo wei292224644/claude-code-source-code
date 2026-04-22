@@ -3,13 +3,13 @@
 > 本文档详细描述 Claude Code 中 Skills 模块的架构设计与实现细节。内容基于源代码分析，涵盖 SKILL.md 规范、解析器、加载流程、注册机制、条件触发及 Agent 集成。
 
 **参考源码：**
-- `/Users/wwj/Desktop/myself/claude-code-source-code/src/skills/loadSkillsDir.ts`
-- `/Users/wwj/Desktop/myself/claude-code-source-code/src/skills/bundledSkills.ts`
-- `/Users/wwj/Desktop/myself/claude-code-source-code/src/utils/frontmatterParser.ts`
-- `/Users/wwj/Desktop/myself/claude-code-source-code/src/utils/argumentSubstitution.ts`
-- `/Users/wwj/Desktop/myself/claude-code-source-code/src/types/command.ts`
-- `/Users/wwj/Desktop/myself/claude-code-source-code/src/commands.ts`
-- `/Users/wwj/Desktop/myself/claude-code-source-code/src/tools/SkillTool/SkillTool.ts`
+- `src/skills/loadSkillsDir.ts`
+- `src/skills/bundledSkills.ts`
+- `src/utils/frontmatterParser.ts`
+- `src/utils/argumentSubstitution.ts`
+- `src/types/command.ts`
+- `src/commands.ts`
+- `src/tools/SkillTool/SkillTool.ts`
 
 ---
 

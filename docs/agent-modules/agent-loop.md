@@ -1,7 +1,7 @@
 # Agent Loop 模块技术文档
 
 > 参考实现：TypeScript 版位于 `src/query.ts` 和 `src/QueryEngine.ts`
-> 本文档为 Python 版本（claude-agent-sdk >= 0.1.59）
+> 本文档为 Python 版本，LLM 调用层使用 **LiteLLM**（provider-agnostic）
 
 ---
 
@@ -19,7 +19,7 @@
 
 ### 1.2 agent/query_engine.py 核心职责
 
-`query_engine.py` 是对 `claude-agent-sdk` 的封装层，负责：
+`query_engine.py` 是对 LiteLLM 的封装层，负责：
 
 1. **Stream 管理**：将 SDK 的 `AsyncGenerator` 流式响应转换为 Python async generator 模式
 2. **Token 计算与上报**：从流式事件中提取 `usage`（input_tokens、output_tokens、cache 统计）
@@ -101,7 +101,7 @@ class AssistantMessage(BaseModel):
     )
     timestamp: datetime = Field(default_factory=datetime.now)
     uuid: str | None = None
-    stop_reason: Literal["end_turn", "max_tokens", "stop_sequence"] | None = None
+    stop_reason: Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None = None
     is_api_error_message: bool = False  # API 错误标记
 
     def get_tool_uses(self) -> list[ToolUseBlock]:
@@ -208,6 +208,7 @@ tool_result = ToolResultMessage(
 ```python
 # agent/loop.py
 import asyncio
+import dataclasses
 from typing import AsyncGenerator, Annotated
 from dataclasses import dataclass, field
 import uuid
@@ -221,7 +222,8 @@ from agent.types import (
     ToolUseBlock,
 )
 from agent.query_engine import QueryEngine, QueryEngineConfig
-from tools.registry import ToolRegistry
+from agent.tool_execution import execute_tool_safe, _error_result
+from tools.registry import ToolRegistry, get_tool_registry
 from tools.tool import Tool, ToolUseContext, ToolResult
 
 
@@ -290,7 +292,6 @@ async def run_agent_loop(
 
     engine = QueryEngine(qe_config)
 
-    # eslint-disable-next-line no-constant-condition
     while True:
         # === 每轮迭代开始：解构状态 ===
         tool_use_context = state.tool_use_context
@@ -324,6 +325,8 @@ async def run_agent_loop(
 
                 # ---- AssistantMessage 处理 ----
                 if event.type == "assistant":
+                    # 先持久化到 state（不可变更新），再 yield——避免 state.messages[-1] 读到旧消息
+                    state = dataclasses.replace(state, messages=[*state.messages, event])
                     yield event
 
                     # 检查是否需要 follow-up（tool_use 块存在）
@@ -339,8 +342,11 @@ async def run_agent_loop(
                         elif event.stop_reason == "max_tokens":
                             # max_tokens：注入恢复消息，继续循环
                             recovery_msg = _create_max_tokens_recovery_message()
-                            state.messages.append(recovery_msg)
-                            state.turn_count += 1
+                            state = dataclasses.replace(
+                                state,
+                                messages=[*state.messages, recovery_msg],
+                                turn_count=state.turn_count + 1,
+                            )
                             continue
                         elif event.stop_reason == "stop_sequence":
                             # stop_sequence：按 stop_sequence 处理
@@ -365,31 +371,36 @@ async def run_agent_loop(
         except Exception as e:
             # API 调用失败
             error_msg = _handle_api_error(e, state.messages)
-            state.messages.append(error_msg)
-            state.turn_count += 1
+            state = dataclasses.replace(
+                state,
+                messages=[*state.messages, error_msg],
+                turn_count=state.turn_count + 1,
+            )
             continue
 
         # === 执行 tool_use 块 ===
-        # 仅当 needs_follow_up == True 时到达此处
+        # AssistantMessage 已在上方持久化，state.messages[-1] 此时一定是它
         assistant_msg = state.messages[-1] if state.messages else None
         if not isinstance(assistant_msg, AssistantMessage):
             continue
 
         tool_use_blocks = assistant_msg.get_tool_uses()
+        registry = get_tool_registry()
 
-        # 并发或串行执行工具（取决于工具类型）
-        tool_results: list[ToolResultMessage] = []
-        for tool_block in tool_use_blocks:
-            result = await _execute_single_tool(
-                tool_block,
-                tool_use_context,
-                state.messages,
-            )
-            tool_results.append(result)
+        # 并发执行所有工具（asyncio.gather 实现真正并行，不再串行等待）
+        async def _run_one(block: ToolUseBlock) -> ToolResultMessage:
+            tool = registry.get(block.name)
+            if tool is None:
+                return _error_result(block.id, f"Tool '{block.name}' not found", is_recoverable=False)
+            return await execute_tool_safe(tool_block=block, tool=tool, context=tool_use_context)
 
-        # 将 tool_result 添加到消息历史
+        tool_results: list[ToolResultMessage] = list(
+            await asyncio.gather(*[_run_one(b) for b in tool_use_blocks])
+        )
+
+        # 不可变更新：一次性将所有结果追加到消息历史
+        state = dataclasses.replace(state, messages=[*state.messages, *tool_results])
         for result in tool_results:
-            state.messages.append(result)
             yield result
 
         # === 检查中止条件 ===
@@ -409,9 +420,25 @@ async def run_agent_loop(
             )
             return None
 
-        # === 轮次递增，继续循环 ===
-        state.turn_count += 1
-        state.total_usage = _merge_usage(state.total_usage, current_usage)
+        # === 轮次递增，继续循环（不可变更新）===
+        state = dataclasses.replace(
+            state,
+            turn_count=state.turn_count + 1,
+            total_usage=_merge_usage(state.total_usage, current_usage),
+        )
+
+
+def _prepare_messages_for_query(
+    messages: list[HumanMessage | AssistantMessage | ToolResultMessage | SystemMessage],
+) -> list[HumanMessage | AssistantMessage | ToolResultMessage]:
+    """
+    过滤并准备发送给 LLM 的消息列表。
+
+    过滤规则：
+    - 移除 SystemMessage（控制信号，不发送给 LLM）
+    - 保留 HumanMessage、AssistantMessage、ToolResultMessage
+    """
+    return [msg for msg in messages if not isinstance(msg, SystemMessage)]
 
 
 def _build_tool_use_context(config: LoopConfig) -> ToolUseContext:
@@ -424,7 +451,7 @@ def _build_tool_use_context(config: LoopConfig) -> ToolUseContext:
             "is_non_interactive_session": True,
             "max_budget_usd": config.max_budget_usd,
         },
-        abort_controller=asyncio.get_event_loop().create_wfd(),
+        abort_controller=asyncio.Event(),
         # ... 其他必要字段
     )
 
@@ -467,7 +494,7 @@ def _handle_api_error(
 
 ```python
 # stop_reason 类型定义
-StopReason = Literal["end_turn", "max_tokens", "stop_sequence"]
+StopReason = Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
 
 # stop_reason 处理逻辑
 def _handle_stop_reason(
@@ -503,18 +530,22 @@ def _handle_stop_reason(
 
 ## 4. QueryEngine 封装 (agent/query_engine.py)
 
-### 4.1 封装 claude-agent-sdk 客户端
+### 4.1 封装 LiteLLM 客户端
+
+LiteLLM 是 provider-agnostic 的 LLM 调用库，提供统一的 OpenAI 兼容接口。通过设置 `model` 参数前缀（如 `"anthropic/claude-sonnet-4-20250514"`、`"openai/gpt-4o"`），可以透明地切换底层提供商，无需改动调用代码。
 
 ```python
 # agent/query_engine.py
 import asyncio
 import os
-from typing import AsyncGenerator, Any, Literal
+import json
+from typing import AsyncGenerator, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 import uuid
 
-from anthropic import AsyncAnthropic
+import litellm
+from litellm import acompletion
 
 
 @dataclass
@@ -533,18 +564,23 @@ class QueryEngineConfig:
 
 class QueryEngine:
     """
-    QueryEngine 封装 SDK 客户端，管理流式响应和 session 状态。
+    QueryEngine 封装 LiteLLM，管理流式响应和 session 状态。
 
     职责：
-    1. 创建/管理 SDK client 实例
-    2. 将 Python async generator 转换为 SDK 流式响应
+    1. 通过 LiteLLM 调用任意 LLM 提供商（Anthropic、OpenAI、Gemini 等）
+    2. 将流式响应转换为内部消息格式
     3. Token 计算与上报
     4. stop_signal 处理（中断信号）
+
+    模型选择：
+    - Anthropic: "anthropic/claude-sonnet-4-20250514"
+    - OpenAI:    "openai/gpt-4o"
+    - Gemini:    "gemini/gemini-1.5-pro"
+    - 本地 Ollama: "ollama/llama3"
     """
 
     def __init__(self, config: QueryEngineConfig):
         self.config = config
-        self._client: AsyncAnthropic | None = None
         self._session_id: str = str(uuid.uuid4())
         self._total_usage: dict = {
             "input_tokens": 0,
@@ -554,18 +590,6 @@ class QueryEngine:
         }
         self._abort_controller: asyncio.Event | None = None
 
-    @property
-    def client(self) -> AsyncAnthropic:
-        """延迟初始化 SDK 客户端"""
-        if self._client is None:
-            # 从环境变量读取 API Key
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-            if not api_key:
-                raise ValueError("ANTHROPIC_API_KEY not set")
-
-            self._client = AsyncAnthropic(api_key=api_key)
-        return self._client
-
     async def submit_message(
         self,
         messages: list[dict[str, Any]],
@@ -574,120 +598,125 @@ class QueryEngine:
         发送消息到 LLM，返回流式响应。
 
         Args:
-            messages: 消息列表，格式同 Anthropic SDK
+            messages: 消息列表，OpenAI 格式（LiteLLM 兼容）
 
         Yields:
-            - StreamEvent: SDK 流式事件
+            - StreamEvent: 流式事件
             - AssistantMessage: 组装后的完整 assistant 消息
-            - ToolResultMessage: 工具结果
             - SystemMessage: 系统消息
         """
         # 转换消息格式
-        sdk_messages = [_to_sdk_message(m) for m in messages]
+        api_messages = [_to_api_message(m) for m in messages]
 
-        # 构建工具列表
-        sdk_tools = [_to_sdk_tool(t) for t in self.config.tools]
+        # 添加 system prompt
+        if self.config.system_prompt:
+            api_messages.insert(0, {"role": "system", "content": self.config.system_prompt})
+
+        # 构建工具列表（OpenAI function-calling 格式，LiteLLM 自动转换）
+        tools_param = [_to_litellm_tool(t) for t in self.config.tools] or None
 
         # 创建中止控制器
         abort_event = asyncio.Event()
         self._abort_controller = abort_event
 
-        # 构建请求参数
-        request_kwargs = {
-            "model": self.config.tool_use_context.get("main_loop_model", "claude-sonnet-4-20250514"),
-            "max_tokens": 8192,
-            "messages": sdk_messages,
-            "system": self.config.system_prompt,
-            "tools": sdk_tools if sdk_tools else None,
-            "stream": True,
-        }
-
-        # 添加可选参数
-        if self.config.task_budget:
-            request_kwargs["task_budget"] = self.config.task_budget
+        model = self.config.tool_use_context.get(
+            "main_loop_model", "anthropic/claude-sonnet-4-20250514"
+        )
 
         # === 流式请求 ===
-        accumulated_content: list[dict] = []
-        current_tool_uses: list[Any] = []
-        current_usage: dict | None = None
+        accumulated_text = ""
+        accumulated_tool_calls: list[dict] = []  # {id, name, arguments_str}
+        current_usage: dict = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
         stop_reason: str | None = None
 
         try:
-            async with await self.client.messages.stream(**request_kwargs) as stream:
-                async for event in stream:
-                    # === 事件类型映射 ===
-                    if event.type == "message_start":
-                        current_usage = {
-                            "input_tokens": event.message.usage.input_tokens,
-                            "output_tokens": 0,
-                            "cache_creation_input_tokens": 0,
-                            "cache_read_input_tokens": 0,
-                        }
+            response = await acompletion(
+                model=model,
+                messages=api_messages,
+                tools=tools_param,
+                max_tokens=8192,
+                stream=True,
+            )
 
-                    elif event.type == "content_block_start":
-                        block = event.content_block
-                        if block.type == "tool_use":
-                            current_tool_uses.append(block)
-                            accumulated_content.append({
-                                "type": "tool_use",
-                                "id": block.id,
-                                "name": block.name,
-                                "input": block.input or {},
-                            })
-                        elif block.type == "text":
-                            accumulated_content.append({
-                                "type": "text",
-                                "text": "",
-                            })
+            async for chunk in response:
+                # LiteLLM streaming chunk 结构（OpenAI 兼容）
+                delta = chunk.choices[0].delta if chunk.choices else None
 
-                    elif event.type == "content_block_delta":
-                        delta = event.delta
-                        if delta.type == "text_delta":
-                            # 更新最后一个 text block
-                            if accumulated_content and accumulated_content[-1]["type"] == "text":
-                                accumulated_content[-1]["text"] += delta.text
-                        elif delta.type == "input_json_delta":
-                            # 更新最后一个 tool_use block 的 input
-                            if accumulated_content and accumulated_content[-1]["type"] == "tool_use":
-                                accumulated_content[-1]["input"] = (
-                                    accumulated_content[-1].get("input", "") + delta.partial_json
-                                )
+                if delta is None:
+                    continue
 
-                    elif event.type == "content_block_stop":
-                        # content block 完成
-                        pass
+                # ---- 文本增量 ----
+                if delta.content:
+                    accumulated_text += delta.content
+                    yield StreamEvent(
+                        type="stream_event",
+                        event={"type": "text_delta", "text": delta.content},
+                    )
 
-                    elif event.type == "message_delta":
-                        # 消息级别增量（stop_reason, usage）
-                        if event.delta.stop_reason:
-                            stop_reason = event.delta.stop_reason
-                        if event.usage:
-                            if current_usage is None:
-                                current_usage = {}
-                            current_usage["output_tokens"] = event.usage.output_tokens
+                # ---- 工具调用增量 ----
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        # 扩展列表至所需长度
+                        while len(accumulated_tool_calls) <= idx:
+                            accumulated_tool_calls.append(
+                                {"id": "", "name": "", "arguments_str": ""}
+                            )
+                        if tc_delta.id:
+                            accumulated_tool_calls[idx]["id"] = tc_delta.id
+                        if tc_delta.function and tc_delta.function.name:
+                            accumulated_tool_calls[idx]["name"] = tc_delta.function.name
+                        if tc_delta.function and tc_delta.function.arguments:
+                            accumulated_tool_calls[idx]["arguments_str"] += (
+                                tc_delta.function.arguments
+                            )
 
-                    elif event.type == "message_stop":
-                        # 消息流结束：组装完整 AssistantMessage
-                        final_usage = current_usage or {}
+                # ---- stop_reason ----
+                finish_reason = chunk.choices[0].finish_reason
+                if finish_reason:
+                    # 统一映射到内部 stop_reason 格式
+                    stop_reason = _map_finish_reason(finish_reason)
 
-                        # 更新总 usage
-                        self._total_usage = _merge_usage(self._total_usage, final_usage)
+                # ---- usage（最后一个 chunk 携带）----
+                if hasattr(chunk, "usage") and chunk.usage:
+                    current_usage["input_tokens"] = getattr(chunk.usage, "prompt_tokens", 0)
+                    current_usage["output_tokens"] = getattr(chunk.usage, "completion_tokens", 0)
 
-                        # 回调
-                        if self.config.on_usage:
-                            self.config.on_usage(final_usage)
+            # === 流结束：组装完整 AssistantMessage ===
+            content: list[dict] = []
 
-                        # 组装完整消息
-                        assistant_msg = _build_assistant_message(
-                            content=accumulated_content,
-                            stop_reason=stop_reason,
-                        )
+            if accumulated_text:
+                content.append({"type": "text", "text": accumulated_text})
 
-                        yield assistant_msg
-                        return
+            for tc in accumulated_tool_calls:
+                try:
+                    parsed_input = json.loads(tc["arguments_str"]) if tc["arguments_str"] else {}
+                except json.JSONDecodeError:
+                    parsed_input = {}
+                content.append({
+                    "type": "tool_use",
+                    "id": tc["id"],
+                    "name": tc["name"],
+                    "input": parsed_input,
+                })
+
+            # 更新总 usage
+            self._total_usage = _merge_usage(self._total_usage, current_usage)
+            if self.config.on_usage:
+                self.config.on_usage(current_usage)
+
+            assistant_msg = _build_assistant_message(
+                content=content,
+                stop_reason=stop_reason,
+            )
+            yield assistant_msg
 
         except asyncio.CancelledError:
-            # 中断信号
             yield _build_system_message(
                 subtype="api_retry",
                 content="Request cancelled",
@@ -695,7 +724,6 @@ class QueryEngine:
             raise
 
         except Exception as e:
-            # API 错误
             error_type = _classify_api_error(e)
 
             if error_type == "rate_limit":
@@ -731,8 +759,19 @@ class QueryEngine:
         return self._session_id
 
 
-def _to_sdk_message(msg: Any) -> dict:
-    """将内部消息格式转换为 SDK 格式"""
+def _map_finish_reason(finish_reason: str) -> str:
+    """将 OpenAI finish_reason 映射到内部 stop_reason"""
+    mapping = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_calls": "tool_use",
+        "content_filter": "stop_sequence",
+    }
+    return mapping.get(finish_reason, finish_reason)
+
+
+def _to_api_message(msg: Any) -> dict:
+    """将内部消息格式转换为 OpenAI / LiteLLM 格式"""
     if hasattr(msg, "role"):
         return {
             "role": msg.role,
@@ -741,12 +780,15 @@ def _to_sdk_message(msg: Any) -> dict:
     return msg
 
 
-def _to_sdk_tool(tool: Any) -> dict:
-    """将内部工具格式转换为 SDK 格式"""
+def _to_litellm_tool(tool: Any) -> dict:
+    """将内部工具定义转换为 OpenAI function-calling 格式（LiteLLM 兼容）"""
     return {
-        "name": tool.name,
-        "description": getattr(tool, "description", ""),
-        "input_schema": getattr(tool, "input_schema", {}),
+        "type": "function",
+        "function": {
+            "name": getattr(tool, "name", ""),
+            "description": getattr(tool, "description", ""),
+            "parameters": getattr(tool, "input_schema", {}),
+        },
     }
 
 
@@ -804,37 +846,7 @@ def _merge_usage(a: dict, b: dict) -> dict:
 
 ### 4.2 Token 计算与上报
 
-```python
-def _accumulate_usage(
-    target: dict,
-    event: Any,
-) -> None:
-    """从 SDK event 中提取并累加 usage"""
-    event_type = getattr(event, "type", None)
-
-    if event_type == "message_delta":
-        usage = getattr(event, "usage", {}) or {}
-        target["output_tokens"] += getattr(usage, "output_tokens", 0)
-
-    elif event_type == "message_start":
-        message = getattr(event, "message", None)
-        if message:
-            usage = getattr(message, "usage", {}) or {}
-            target["input_tokens"] += getattr(usage, "input_tokens", 0)
-            target["cache_read_input_tokens"] += getattr(usage, "cache_read_input_tokens", 0)
-
-
-def _merge_usage(a: dict, b: dict) -> dict:
-    """合并两个 usage 字典"""
-    return {
-        "input_tokens": a.get("input_tokens", 0) + b.get("input_tokens", 0),
-        "output_tokens": a.get("output_tokens", 0) + b.get("output_tokens", 0),
-        "cache_creation_input_tokens": a.get("cache_creation_input_tokens", 0)
-                                    + b.get("cache_creation_input_tokens", 0),
-        "cache_read_input_tokens": a.get("cache_read_input_tokens", 0)
-                                 + b.get("cache_read_input_tokens", 0),
-    }
-```
+LiteLLM 在流结束的最后一个 chunk 中携带 `usage`（`prompt_tokens` / `completion_tokens`），在 `submit_message` 内直接读取。`_merge_usage`（定义在 4.1 节末尾）负责跨轮次累积 token 统计。
 
 ### 4.3 stop_signal（中断信号）处理
 
@@ -1533,29 +1545,9 @@ async def call_llm_with_retry(
 import traceback
 from agent.types import ToolResultMessage
 
-
-class ToolExecutionError(Exception):
-    """工具执行错误"""
-    tool_name: str
-    tool_input: dict
-    is_recoverable: bool = True  # 是否可恢复
-
-    def __init__(
-        self,
-        message: str,
-        tool_name: str = "",
-        tool_input: dict | None = None,
-        is_recoverable: bool = True,
-    ):
-        super().__init__(message)
-        self.tool_name = tool_name
-        self.tool_input = tool_input or {}
-        self.is_recoverable = is_recoverable
-
-
-class ValidationError(Exception):
-    """输入验证错误"""
-    pass
+# ToolExecutionError 和 ValidationError 的定义见第 5.3 节（agent/tool_execution.py）。
+# 此处直接使用，不重复定义：
+# from agent.tool_execution import ToolExecutionError, ValidationError
 
 
 async def execute_tool_safe(
@@ -1984,7 +1976,7 @@ async def example_tool_handler(
 
 ## 附录 B: 参考文件
 
-- 源实现：`/Users/wwj/Desktop/myself/claude-code-source-code/src/query.ts`
-- SDK 封装：`/Users/wwj/Desktop/myself/claude-code-source-code/src/QueryEngine.ts`
-- Tool 接口：`/Users/wwj/Desktop/myself/claude-code-source-code/src/Tool.ts`
-- 架构概览：`/Users/wwj/Desktop/myself/claude-code-source-code/docs/agent-architecture.md`
+- 源实现：`src/query.ts`
+- SDK 封装：`src/QueryEngine.ts`
+- Tool 接口：`src/Tool.ts`
+- 架构概览：`docs/agent-architecture.md`

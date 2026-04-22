@@ -292,28 +292,10 @@ from typing import TypedDict, NotRequired
 
 
 # -----------------------------------------------------------------------------
-# Message types
+# Message types — 从 agent/types.py 统一导入，此处不重复定义
 # -----------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class HumanMessage:
-    role: str = "user"
-    content: str
-
-
-@dataclass(frozen=True)
-class AssistantMessage:
-    role: str = "assistant"
-    content: str
-    tool_use: list[dict[str, Any]] = field(default_factory=list)
-    stop_reason: str | None = None
-
-
-@dataclass(frozen=True)
-class ToolResultMessage:
-    tool_use_id: str
-    content: str
-    is_error: bool = False
+# 完整定义（含字段验证、get_tool_uses() 等）见 agent-loop.md 第 2 节。
+from agent.types import HumanMessage, AssistantMessage, ToolResultMessage
 
 
 # -----------------------------------------------------------------------------
@@ -351,17 +333,10 @@ class Tool:
 
 
 # -----------------------------------------------------------------------------
-# AppConfig
+# AppConfig (see config.py section 4 for full definition)
 # -----------------------------------------------------------------------------
-
-@dataclass
-class AppConfig:
-    model: str = "claude-sonnet-4-20250514"
-    temperature: float = 1.0
-    max_tokens: int = 8192
-    api_key: str | None = None
-    mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
-    skills_dir: str | None = None
+# AppConfig is defined as a TypedDict in config.py (section 4).
+# It holds: api: APIConfig, mcp: MCPConfig, skills: SkillsConfig, model: ModelConfig
 
 
 # -----------------------------------------------------------------------------
@@ -646,22 +621,10 @@ import time
 
 
 # -----------------------------------------------------------------------------
-# Message types（与 state/store.py 保持一致）
+# Message types — 从 agent/types.py 导入（不在此处重复定义）
+# from agent.types import HumanMessage, AssistantMessage, ToolResultMessage
+# 完整定义见 agent-loop.md 第 2 节。
 # -----------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class HumanMessage:
-    role: str = "user"
-    content: str
-
-
-@dataclass(frozen=True)
-class AssistantMessage:
-    role: str = "assistant"
-    content: str
-    tool_use: list[dict[str, Any]] = field(default_factory=list)
-    stop_reason: str | None = None
-
 
 # -----------------------------------------------------------------------------
 # API Message format（发送给 LLM 的格式）
@@ -696,44 +659,38 @@ class BuildContextInput:
 
 def build_context(input: BuildContextInput) -> list[APIMessage]:
     """
-    构建发送给 LLM 的消息上下文。
+    将 store 中的消息历史转换为 LLM API 可消费格式。
+
+    此函数是**纯转换函数**，不修改 store 状态。
+    调用方必须在调用此函数之前，通过 `append_user_message()` 将用户输入持久化到 store，
+    否则用户输入只存在于本地临时列表，崩溃后不可恢复。
+
+    正确调用顺序：
+        store.set(lambda s: append_user_message(s, user_input))   # 先持久化
+        state = store.get_state()
+        context = build_context(BuildContextInput(current_state=state, ...))  # 再转换
 
     Args:
-        input.user_input: 用户当前的输入
-        input.current_state: 应用当前状态（包含 messages 等）
+        input.current_state: 应用当前状态（包含已持久化的 messages）
         input.system_prompt: 可选的系统提示（覆盖默认）
         input.max_history: 消息历史最大长度
-
-    Returns:
-        list[APIMessage]: 可直接发送给 LLM 的消息列表
-
-    消息历史维护规则：
-    1. HumanMessage: 每次用户输入后追加
-    2. AssistantMessage: LLM 响应后追加
-    3. ToolResultMessage: 工具执行结果后追加（作为 HumanMessage）
-    4. 超过 max_history 的早期消息会被截断（保留系统提示）
     """
     state = input.current_state
     messages = list(state.get("messages", []))
     system_prompt = input.system_prompt
 
     # -------------------------------------------------------------------------
-    # 1. 追加当前用户输入（HumanMessage）
-    # -------------------------------------------------------------------------
-    messages.append(HumanMessage(role="user", content=input.user_input))
-
-    # -------------------------------------------------------------------------
-    # 2. Context Window 管理：截断超长历史
+    # 1. Context Window 管理：截断超长历史
     # -------------------------------------------------------------------------
     messages = _truncate_history(messages, input.max_history)
 
     # -------------------------------------------------------------------------
-    # 3. 转换为 API 格式
+    # 2. 转换为 API 格式
     # -------------------------------------------------------------------------
     api_messages = _convert_to_api_format(messages)
 
     # -------------------------------------------------------------------------
-    # 4. 添加系统提示（如有）
+    # 3. 添加系统提示（如有）
     # -------------------------------------------------------------------------
     if system_prompt:
         api_messages.insert(0, {"role": "system", "content": system_prompt})
@@ -837,12 +794,21 @@ def append_tool_result_message(
     """
     向状态追加工具结果消息。
 
-    工具结果作为 HumanMessage 追加，以保持对话轮次的正确性。
+    必须使用 Anthropic API 要求的 tool_result content block 格式。
+    纯文本字符串（如 "[Tool: id]\\n..."）会导致模型无法关联 tool_use 与结果，
+    在多工具轮次中产生幻觉或 API 验证错误。
     """
     messages = list(state.get("messages", []))
-    # 工具结果格式：tool_use_id + 结果内容
-    tool_result_content = f"[Tool: {tool_use_id}]\n{content}"
-    messages.append(HumanMessage(role="user", content=tool_result_content))
+    messages.append(ToolResultMessage(
+        content=[{
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+            "is_error": is_error,
+        }],
+        tool_use_id=tool_use_id,
+        is_error=is_error,
+    ))
     return {**state, "messages": messages}
 ```
 
@@ -866,17 +832,21 @@ def append_tool_result_message(
 #
 # ToolResultMessage 追加规则：
 # - 每次工具执行完成后创建
-# - 作为 HumanMessage 追加（保持 user→assistant 交替）
-# - content 格式：[Tool: {tool_use_id}]\n{结果}
+# - role="user"，content 为 tool_result content block 列表
+# - 结构：[{"type": "tool_result", "tool_use_id": id, "content": result, "is_error": bool}]
 
 # -----------------------------------------------------------------------------
 # Context Window 管理
 # -----------------------------------------------------------------------------
 
 CONTEXT_WINDOW_LIMITS = {
-    "claude-sonnet-4-20250514": 200000,
-    "claude-opus-4-20250514": 200000,
-    "claude-haiku-4-20250724": 200000,
+    # LiteLLM 格式：provider/model
+    "anthropic/claude-sonnet-4-20250514": 200000,
+    "anthropic/claude-opus-4-20250514": 200000,
+    "anthropic/claude-haiku-4-20250724": 200000,
+    "openai/gpt-4o": 128000,
+    "openai/gpt-4-turbo": 128000,
+    "gemini/gemini-1.5-pro": 1000000,
 }
 
 
@@ -965,15 +935,19 @@ assistant_message_with_tool = {
 }
 
 # -----------------------------------------------------------------------------
-# Tool Result Message (作为 HumanMessage)
+# Tool Result Message（使用 Anthropic API tool_result content block 格式）
 # -----------------------------------------------------------------------------
 
 tool_result_message = {
     "role": "user",
-    "content": "[Tool: toolu_01A2B3C4D5E6]\n"
-               "total 32\n"
-               "drwxr-xr-x  12 user  staff   384 Apr 15 10:00 .\n"
-               "drwxr-xr-x   8 user  staff   256 Apr 15 09:30 ...",
+    "content": [
+        {
+            "type": "tool_result",
+            "tool_use_id": "toolu_01A2B3C4D5E6",
+            "content": "total 32\ndrwxr-xr-x  12 user  staff   384 Apr 15 10:00 .\ndrwxr-xr-x   8 user  staff   256 Apr 15 09:30 ...",
+            "is_error": False,
+        }
+    ],
 }
 ```
 
@@ -995,20 +969,24 @@ from pathlib import Path
 
 @dataclass
 class APIConfig:
-    """API 相关配置"""
-    api_key: str | None = None  # 从环境变量 ANTHROPIC_API_KEY 读取
-    base_url: str | None = None  # 可选的自定义 API URL
-    timeout: int = 60  # 请求超时（秒）
-    max_retries: int = 3  # 最大重试次数
+    """API 相关配置（LiteLLM provider-agnostic）"""
+    api_key: str | None = None   # 通用 API Key，也可由 LiteLLM 从各 provider 环境变量自动读取
+    base_url: str | None = None  # 可选的自定义 API endpoint（用于代理或本地模型）
+    timeout: int = 60            # 请求超时（秒）
+    max_retries: int = 3         # 最大重试次数
 
     @classmethod
     def from_env(cls) -> APIConfig:
-        """从环境变量加载 API 配置"""
+        """从环境变量加载 API 配置。
+
+        LiteLLM 会自动读取各 provider 的 key（如 OPENAI_API_KEY、ANTHROPIC_API_KEY）。
+        LLM_API_KEY 作为通用覆盖，优先级高于 provider-specific key。
+        """
         return cls(
-            api_key=os.environ.get("ANTHROPIC_API_KEY"),
-            base_url=os.environ.get("ANTHROPIC_BASE_URL"),
-            timeout=int(os.environ.get("ANTHROPIC_TIMEOUT", "60")),
-            max_retries=int(os.environ.get("ANTHROPIC_MAX_RETRIES", "3")),
+            api_key=os.environ.get("LLM_API_KEY"),
+            base_url=os.environ.get("LLM_BASE_URL"),
+            timeout=int(os.environ.get("LLM_TIMEOUT", "60")),
+            max_retries=int(os.environ.get("LLM_MAX_RETRIES", "3")),
         )
 
 
@@ -1070,22 +1048,29 @@ class SkillsConfig:
 
 @dataclass
 class ModelConfig:
-    """模型相关配置"""
-    name: str = "claude-sonnet-4-20250514"
+    """模型相关配置。
+
+    LiteLLM 格式：provider/model-name，例如：
+    - "anthropic/claude-sonnet-4-20250514"
+    - "openai/gpt-4o"
+    - "gemini/gemini-1.5-pro"
+    - "ollama/llama3"
+    """
+    name: str = "anthropic/claude-sonnet-4-20250514"
     temperature: float = 1.0
     max_tokens: int = 8192
     top_p: float = 0.9  # nucleus sampling
-    top_k: int = 40  # top-k sampling
+    top_k: int = 40     # top-k sampling（部分 provider 支持）
 
     @classmethod
     def from_env(cls) -> ModelConfig:
         """从环境变量加载模型配置"""
         return cls(
-            name=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
-            temperature=float(os.environ.get("ANTHROPIC_TEMPERATURE", "1.0")),
-            max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS", "8192")),
-            top_p=float(os.environ.get("ANTHROPIC_TOP_P", "0.9")),
-            top_k=int(os.environ.get("ANTHROPIC_TOP_K", "40")),
+            name=os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4-20250514"),
+            temperature=float(os.environ.get("LLM_TEMPERATURE", "1.0")),
+            max_tokens=int(os.environ.get("LLM_MAX_TOKENS", "8192")),
+            top_p=float(os.environ.get("LLM_TOP_P", "0.9")),
+            top_k=int(os.environ.get("LLM_TOP_K", "40")),
         )
 
 
@@ -1124,8 +1109,8 @@ class ValidatedMCPServerConfig(BaseModel):
 
 
 class ValidatedModelConfig(BaseModel):
-    """模型配置验证"""
-    name: str = Field(default="claude-sonnet-4-20250514")
+    """模型配置验证。model name 使用 LiteLLM 格式：provider/model-name"""
+    name: str = Field(default="anthropic/claude-sonnet-4-20250514")
     temperature: float = Field(default=1.0, ge=0, le=2)
     max_tokens: int = Field(default=8192, ge=1, le=200000)
     top_p: float = Field(default=0.9, ge=0, le=1)
@@ -1134,12 +1119,9 @@ class ValidatedModelConfig(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_model_name(cls, v: str) -> str:
-        valid_models = [
-            "claude-sonnet-4-20250514",
-            "claude-opus-4-20250514",
-            "claude-haiku-4-20250724",
-        ]
-        # 允许自定义模型名
+        # LiteLLM 接受任意 "provider/model" 格式，不在这里白名单校验
+        if not v:
+            raise ValueError("model name cannot be empty")
         return v
 
 
@@ -1220,14 +1202,15 @@ class Agent:
         self._skills_loader = self._create_skills_loader(config.skills)
 
     def _create_api_client(self, api_config: APIConfig):
-        """创建 API 客户端（使用注入的配置）"""
-        from anthropic import AsyncAnthropic
-        return AsyncAnthropic(
-            api_key=api_config.api_key,
-            base_url=api_config.base_url,
-            timeout=api_config.timeout,
-            max_retries=api_config.max_retries,
-        )
+        """配置 LiteLLM 全局参数（无需创建 client 实例，LiteLLM 是函数式调用）"""
+        import litellm
+        if api_config.api_key:
+            litellm.api_key = api_config.api_key
+        if api_config.base_url:
+            litellm.api_base = api_config.base_url
+        litellm.request_timeout = api_config.timeout
+        litellm.num_retries = api_config.max_retries
+        return None  # LiteLLM 不需要 client 对象
 
     def _create_mcp_manager(self, mcp_config: MCPConfig):
         """创建 MCP 管理器（使用注入的配置）"""
@@ -1326,7 +1309,10 @@ class Agent:
                 if user_input is None:
                     break
 
-                # 构建上下文
+                # 先将用户消息持久化到 store（build_context 是纯函数，不会自动写入）
+                self._store.set(lambda s: append_user_message(s, user_input))
+
+                # 再读取已更新的 state，构建 API 消息列表
                 state = self._store.get_state()
                 context_input = BuildContextInput(
                     user_input=user_input,
@@ -1370,24 +1356,40 @@ class Agent:
             return None
 
     async def _call_llm(self, context: list[dict[str, Any]]) -> dict[str, Any]:
-        """调用 LLM API"""
-        from anthropic import AsyncAnthropic
+        """调用 LLM API（通过 LiteLLM，provider-agnostic）"""
+        from litellm import acompletion
 
-        client = AsyncAnthropic(api_key=self._config.api.api_key)
-
-        response = await client.messages.create(
+        response = await acompletion(
             model=self._config.model.name,
             max_tokens=self._config.model.max_tokens,
             messages=context,
         )
 
+        choice = response.choices[0]
+        message = choice.message
+
+        # 提取文本内容
+        content = message.content or ""
+
+        # 提取工具调用（OpenAI function-calling 格式）
+        tool_use = []
+        if message.tool_calls:
+            import json
+            for tc in message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                except json.JSONDecodeError:
+                    args = {}
+                tool_use.append({"id": tc.id, "name": tc.function.name, "input": args})
+
+        # 映射 finish_reason → stop_reason
+        finish_map = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+        stop_reason = finish_map.get(choice.finish_reason, choice.finish_reason)
+
         return {
-            "content": response.content[0].text if response.content else "",
-            "tool_use": [
-                {"id": tc.id, "name": tc.name, "input": tc.input}
-                for tc in response.tool_calls or []
-            ],
-            "stop_reason": response.stop_reason,
+            "content": content,
+            "tool_use": tool_use,
+            "stop_reason": stop_reason,
         }
 
     async def _execute_tool(self, tool_call: dict[str, Any]) -> dict[str, Any]:
@@ -1560,9 +1562,10 @@ if __name__ == "__main__":
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          services/api/client.py                             │
 │  ┌─────────────────────────────────────────────────────────────────────────┐ │
-│  │                       AsyncAnthropic                                     │ │
-│  │  • messages.create(model, max_tokens, messages)                          │ │
-│  │  • 使用 config.api.api_key 进行认证                                       │ │
+│  │                  LiteLLM (litellm.acompletion)                           │ │
+│  │  • acompletion(model, max_tokens, messages)                              │ │
+│  │  • model = "anthropic/..." | "openai/..." | "gemini/..." | "ollama/..."  │ │
+│  │  • API key 由 LLM_API_KEY 或各 provider 环境变量提供                      │ │
 │  └─────────────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────────┘
           │

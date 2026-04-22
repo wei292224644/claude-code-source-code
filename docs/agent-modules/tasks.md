@@ -4,7 +4,7 @@
 
 本文档描述 Claude Code 中 **Tasks/Subagent** 模块的完整设计与实现。该模块负责管理子代理（Subagent）的生命周期，支持三种执行模式：本地代理（LocalAgent）、远程代理（RemoteAgent）和进程内队友（InProcessTeammate）。
 
-**源码位置**：`/Users/wwj/Desktop/myself/claude-code-source-code/src/tasks/`
+**源码位置**：`src/tasks/`
 
 ---
 

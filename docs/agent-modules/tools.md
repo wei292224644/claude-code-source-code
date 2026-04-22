@@ -491,7 +491,7 @@ class _ToolImpl:
         self.input_schema = input_schema
         self.output_schema = output_schema
         self.max_result_size_chars = max_result_size_chars
-        self.description = description
+        self._description_fn = description  # 存为 _description_fn 避免与 description() 方法同名
         self.prompt = prompt
         self.is_enabled = is_enabled
         self.is_concurrency_safe = is_concurrency_safe
@@ -536,7 +536,7 @@ class _ToolImpl:
         return await self._call(args, context, can_use_tool, parent_message, on_progress)
 
     async def description(self, input_args: dict[str, Any]) -> str:
-        return await self.description(input_args)  # type: ignore
+        return self._description_fn(input_args)
 
     def map_tool_result_to_block_param(self, content: Any, tool_use_id: str) -> dict[str, Any]:
         """将执行结果映射为 SDK 的 ToolResultBlockParam 格式."""
@@ -670,8 +670,8 @@ class ToolResultContent(BaseModel):
 
 class ToolResultBlock(BaseModel):
     """
-    对应 @anthropic-ai/sdk/resources/index.mjs 的 ToolResultBlockParam。
-    即 LLM 看到的 tool_result 块。
+    tool_result 块，格式同 OpenAI function-calling / Anthropic tool_result。
+    即 LLM 看到的工具执行结果。
     """
     type: str = "tool_result"
     tool_use_id: str
