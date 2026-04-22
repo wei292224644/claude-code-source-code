@@ -210,6 +210,407 @@ if (feature('HISTORY_SNIP')) {
 
 > **注意**：snipCompact 模块在发布版本中被消除（`feature('HISTORY_SNIP')` 返回 `false`），仅在内部版本可用。
 
+### 模块组成（基于代码线索的反向推导）
+
+snipCompact 的源代码已被 dead-code elimination 移除，但代码库中留下了大量调用痕迹、类型签名、注释和命名。以下基于这些线索反向推导出的实现细节。
+
+#### 涉及的三个模块
+
+| 模块 | 路径（已消除） | 导出符号 | 作用 |
+|------|--------------|---------|------|
+| snipCompact | `src/services/compact/snipCompact.js` | `snipCompactIfNeeded`, `isSnipRuntimeEnabled`, `isSnipMarkerMessage`, `shouldNudgeForSnips`, `SNIP_NUDGE_TEXT` | 核心 snip 逻辑 |
+| snipProjection | `src/services/compact/snipProjection.js` | `projectSnippedView`, `isSnipBoundaryMessage` | API 视图过滤 |
+| SnipTool | `src/tools/SnipTool/SnipTool.js` | `SnipTool`（工具实例） | Claude 调用的工具 |
+
+#### 关键发现：boundary 消息存储 removedUuids
+
+`src/utils/sessionStorage.ts:1982-1992` 揭示了核心数据模型：
+
+```typescript
+// boundary 消息携带 snipMetadata，记录被删除消息的 UUID 列表
+type WithSnipMeta = { snipMetadata?: { removedUuids?: UUID[] } }
+
+function applySnipRemovals(messages: Map<UUID, TranscriptMessage>): void {
+  const toDelete = new Set<UUID>()
+  for (const entry of messages.values()) {
+    const removedUuids = (entry as WithSnipMeta).snipMetadata?.removedUuids
+    if (!removedUuids) continue
+    for (const uuid of removedUuids) toDelete.add(uuid)
+  }
+  // 删除对应消息，并重新链接 parentUuid 链
+}
+```
+
+这意味着 snip 不是在每个消息上标记 `isSnipped`，而是**在 boundary 消息中记录删除了哪些 UUID**。会话恢复时通过 replay 这些 removals 重建状态。
+
+#### snipCompactIfNeeded 推测实现
+
+```typescript
+// 基于 query.ts:403 调用签名和 QueryEngine.ts:1281 force 选项反向推导
+export function snipCompactIfNeeded(
+  messages: Message[],
+  options?: { force?: boolean }
+): { messages: Message[]; tokensFreed: number; boundaryMessage?: Message } {
+  if (!isSnipRuntimeEnabled()) {
+    return { messages, tokensFreed: 0 }
+  }
+
+  // 1. 判断是否需要执行
+  //    force=true 来自 SDK replay（QueryEngine.ts:1281），跳过阈值检查
+  //    非 force 时检查 token 使用量是否超过某个百分比阈值
+  const needsSnip = options?.force || shouldAutoSnip(messages)
+  if (!needsSnip) return { messages, tokensFreed: 0 }
+
+  // 2. 收集可删除消息的 UUID
+  //    来源：Claude 通过 SnipTool 显式标记的 + 自动策略选择的
+  const removableUuids = collectRemovableUuids(messages)
+  if (removableUuids.size === 0) return { messages, tokensFreed: 0 }
+
+  // 3. 计算释放的 token 数（传递给 autoCompact 阈值检查）
+  const tokensFreed = calculateTokensFreed(messages, removableUuids)
+
+  // 4. 创建 snip marker（内部跟踪消息，UI 中隐藏）
+  //    Message.tsx:277-279: isSnipMarkerMessage → return null
+  const marker = createSnipMarkerMessage(removableUuids)
+
+  // 5. 创建 snip boundary（用户可见 + 携带 snipMetadata）
+  const boundaryMessage = createSnipBoundaryMessage({
+    removedUuids: [...removableUuids],
+    tokensRemoved: tokensFreed,
+  })
+
+  // 6. 过滤消息，插入 marker 和 boundary
+  const filtered = messages.filter(m => !removableUuids.has(m.uuid))
+  return {
+    messages: [...filtered, marker, boundaryMessage],
+    tokensFreed,
+    boundaryMessage,
+  }
+}
+```
+
+#### SnipTool 推测实现
+
+SnipTool 是 Claude 可以调用的工具。`src/utils/messages.ts:196-205` 和 `1616-1638` 揭示了其交互机制——每个用户消息被注入 `[id:xxxxxx]` 标签，Claude 通过这些标签引用消息。
+
+**短 ID 生成**（`src/utils/messages.ts:200-204`）：
+
+```typescript
+function deriveShortMessageId(uuid: string): string {
+  const hex = uuid.replace(/-/g, '').slice(0, 10)
+  return parseInt(hex, 16).toString(36).slice(0, 6)
+}
+// 例如 uuid "a1b2c3d4-e5f6-..." → 短 ID "m8k3f2"
+```
+
+Claude 看到的消息末尾带有标签：
+```
+Here is the file content of foo.ts...
+[id:m8k3f2]
+```
+
+**工具定义**（基于 `buildTool` 模式和 `collapseReadSearch.ts:177-192` 的分类信息反向推导）：
+
+```typescript
+// src/tools/SnipTool/SnipTool.js
+import { z } from 'zod/v4'
+import { buildTool, type ToolDef } from '../../Tool.js'
+import { SNIP_TOOL_NAME } from './prompt.js'
+
+const inputSchema = z.strictObject({
+  messageIds: z
+    .array(z.string())
+    .describe('The [id:xxx] values of messages to remove from context'),
+  reason: z
+    .string()
+    .optional()
+    .describe('Why these messages are no longer needed'),
+})
+
+export const SnipTool = buildTool({
+  name: SNIP_TOOL_NAME,
+
+  // collapseReadSearch.ts:177-192 分类为 "meta-operation absorbed silently"
+  // 不打断 collapse group，verbose 模式才可见
+  isCollapsible: true,
+  isAbsorbedSilently: true,
+
+  // 只读 — 不直接修改任何状态，只是记录意图
+  isReadOnly() { return true },
+  // 允许并发 — 多个 snip 调用可以并行
+  isConcurrencySafe() { return true },
+
+  get inputSchema() { return inputSchema },
+
+  // prompt.js 导出工具描述和系统提示
+  async description() { return DESCRIPTION },
+  async prompt() { return PROMPT },
+
+  async call({ messageIds, reason }, context) {
+    // 1. 收集当前消息中所有可用短 ID → UUID 映射
+    const availableIds = new Map<string, string>()
+    for (const msg of context.messages) {
+      if (msg.type === 'user' && !msg.isMeta) {
+        const shortId = deriveShortMessageId(msg.uuid)
+        availableIds.set(shortId, msg.uuid)
+      }
+    }
+
+    // 2. 解析并验证 Claude 给出的短 ID
+    const resolved: string[] = []
+    const notFound: string[] = []
+    for (const shortId of messageIds) {
+      const uuid = availableIds.get(shortId)
+      if (uuid) {
+        resolved.push(uuid)
+      } else {
+        notFound.push(shortId)
+      }
+    }
+
+    // 3. 返回结果（作为 tool_result，Claude 下一轮能看到）
+    //    注意：这里不删除任何消息！
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ snipped: resolved.length, resolved, notFound, reason }),
+      }],
+    }
+  },
+})
+```
+
+**关键设计：SnipTool 不直接删除消息**。它只验证 ID 并返回确认，实际删除由下一轮 `snipCompactIfNeeded` 执行。原因有三：
+
+1. **职责分离**：Tool 负责"意图"，snipCompact 负责"执行"。Tool 的 `call` 是异步的、可能被取消的，而 snipCompact 在 query loop 开始时同步执行，保证一致性。
+2. **`force` 重放**：QueryEngine 的 snipReplay 需要在自己的 store 上重放 snip（`force: true`）。如果删除逻辑在 Tool 里，QueryEngine 就无法重放。
+3. **token 计数时机**：`tokensFreed` 必须在 API 调用之前计算出来（传递给 autoCompact 的阈值检查）。如果在 Tool 的 `call` 里删除，时机不对——Tool 执行时已经在 API 循环中间了。
+
+**snipCompactIfNeeded 如何消费 SnipTool 的结果**（基于 `microCompact.ts:226-241` 的 `collectCompactableToolIds` 模式推导）：
+
+```typescript
+// snipCompact.js 内部
+function collectRemovableUuids(messages: Message[]): Set<string> {
+  const removable = new Set<string>()
+
+  for (const message of messages) {
+    if (message.type !== 'assistant') continue
+    if (!Array.isArray(message.message.content)) continue
+
+    for (const block of message.message.content) {
+      // 找到 SnipTool 的 tool_use 调用（按工具名过滤）
+      if (block.type === 'tool_use' && block.name === SNIP_TOOL_NAME) {
+        // 从 tool input 中提取 Claude 选择的 messageIds
+        const ids: string[] = block.input?.messageIds ?? []
+
+        // 短 ID → UUID 映射
+        for (const shortId of ids) {
+          const uuid = resolveShortId(shortId, messages)
+          if (uuid) removable.add(uuid)
+        }
+      }
+    }
+  }
+
+  return removable
+}
+```
+
+这和 `microCompact.ts` 的 `collectCompactableToolIds` 是完全一样的模式——遍历 assistant 消息中的 `tool_use` 块，按工具名过滤，提取参数。
+
+**完整执行流程**：
+
+```
+轮次 N:
+  Assistant 消息:
+    tool_use {
+      id: "toolu_abc123",
+      name: "SnipTool",
+      input: { messageIds: ["m8k3f2", "p9q1r2"], reason: "已分析完毕" }
+    }
+
+  User 消息（tool_result）:
+    tool_result {
+      tool_use_id: "toolu_abc123",
+      content: '{"snipped":2,"resolved":["uuid-a","uuid-c"],"notFound":[]}'
+    }
+
+轮次 N+1 开始:
+  snipCompactIfNeeded(messages):
+    1. collectRemovableUuids():
+       - 遍历 assistant 消息
+       - 找到 SnipTool 的 tool_use (name === SNIP_TOOL_NAME)
+       - 提取 input.messageIds = ["m8k3f2", "p9q1r2"]
+       - 解析为 uuid-a, uuid-c
+       - 返回 Set { "uuid-a", "uuid-c" }
+
+    2. 过滤 messages:
+       - 移除 uuid-a 和 uuid-c 对应的消息
+
+    3. 创建 boundary 消息:
+       {
+         type: 'system',
+         subtype: 'snip_boundary',  // 实际值在 excluded-strings.txt 中
+         snipMetadata: { removedUuids: ["uuid-a", "uuid-c"] },
+         tokensRemoved: 15000
+       }
+
+    4. yield boundaryMessage → 用户看到 "✂ 已压缩 15K tokens"
+```
+
+#### 提示词注入机制
+
+SnipTool 的提示词分两层注入，时机不同，共同作用让 Claude 知道工具的存在、用法，以及何时应该使用。
+
+**第一层：工具描述（每轮 API 调用都发送）**
+
+`src/utils/api.ts:169-177`，`toolToAPISchema` 把 SnipTool 的 prompt 变成 API 工具定义的一部分：
+
+```typescript
+// src/utils/api.ts:169-177
+base = {
+  name: tool.name,
+  description: await tool.prompt({
+    getToolPermissionContext: options.getToolPermissionContext,
+    tools: options.tools,
+    agents: options.agents,
+    allowedAgentTypes: options.allowedAgentTypes,
+  }),
+  input_schema,
+}
+```
+
+`SnipTool.prompt()` 返回 `prompt.js` 中的 `PROMPT`，这个文本成为工具定义的 `description` 字段。Claude **每轮 API 调用**都能看到它——它是 `tools` 数组的一部分。这让 Claude 知道：
+- 有 SnipTool 这个工具
+- 可以传入 `[id:xxx]` 标签来引用消息
+- 应该只删除已消费的消息
+
+**第二层：Nudge 提示词（上下文变大时条件注入）**
+
+这是 `src/utils/attachments.ts:3963-3982` 实现的条件注入，只在上下文增长到一定程度时触发。
+
+触发链路：
+
+```
+query.ts:1580  每轮循环中调用 getAttachmentMessages()
+       ↓
+attachments.ts:934-939  收集 attachments 时，检查 context_efficiency
+       ↓
+attachments.ts:3963-3982  getContextEfficiencyAttachment()
+  → isSnipRuntimeEnabled()？
+  → shouldNudgeForSnips(messages)？
+  → 返回 [{ type: 'context_efficiency' }]
+       ↓
+messages.ts:4148-4161  normalizeAttachmentForAPI() 处理 context_efficiency
+  → 读取 snipCompact.js 导出的 SNIP_NUDGE_TEXT
+  → wrapInSystemReminder(SNIP_NUDGE_TEXT)
+  → 变成 <system-reminder> 包裹的 isMeta 用户消息
+```
+
+最终 Claude 看到的消息：
+
+```xml
+<system-reminder>
+Your context is getting large. Consider using the SnipTool to remove
+older messages you no longer need, such as completed file reads or
+finished bash commands. Reference messages by their [id:xxx] tags.
+</system-reminder>
+```
+
+这条消息是 `isMeta: true` 的用户消息——**UI 中不显示，只在 API 上下文中存在**。
+
+**两层的分工**：
+
+| 层 | 注入方式 | 时机 | Claude 看到什么 |
+|---|---------|------|---------------|
+| **工具描述** | `tools` 数组的 `description` 字段 | 每轮 API 调用 | "有一个 SnipTool，可以传 `[id:xxx]` 删除消息" |
+| **Nudge** | `<system-reminder>` 包裹的 `isMeta` 用户消息 | `shouldNudgeForSnips()` 返回 true 时 | "你的上下文变大了，考虑用 SnipTool 清理" |
+
+工具描述让 Claude **知道工具的存在和用法**，Nudge 让 Claude **知道现在应该用它了**。两者缺一不可。
+
+**`shouldNudgeForSnips` 的节奏控制**（基于注释反向推导）：
+
+`src/utils/attachments.ts:3957-3961` 注释说明了 nudge 的节奏：
+
+> Context-efficiency nudge. Injected after every N tokens of growth without a snip. Pacing is handled entirely by shouldNudgeForSnips — the 10k interval resets on prior nudges, snip markers, snip boundaries, and compact boundaries.
+
+即：每增长约 10K tokens 且期间没有执行过 snip 时注入一次 nudge。计时器在以下事件后重置：
+- 之前的 nudge
+- snip marker（内部 snip 事件）
+- snip boundary（用户可见的压缩通知）
+- compact boundary（autoCompact 的压缩通知）
+
+这避免了每轮都提示用户，同时确保上下文持续增长时 Claude 会被周期性地提醒。
+
+#### snipProjection 推测实现
+
+```typescript
+// API 发送前过滤被 snip 的消息
+// src/utils/messages.ts:4648-4654 中调用
+export function projectSnippedView(messages: Message[]): Message[] {
+  // 1. 收集所有 boundary 消息记录的 removedUuids
+  const removedUuids = new Set<string>()
+  for (const msg of messages) {
+    if (isSnipBoundaryMessage(msg)) {
+      const uuids = msg.snipMetadata?.removedUuids ?? []
+      for (const uuid of uuids) removedUuids.add(uuid)
+    }
+  }
+  // 2. 过滤：删除被 snip 的消息 + 内部 marker
+  return messages.filter(m =>
+    !removedUuids.has(m.uuid) && !isSnipMarkerMessage(m)
+  )
+}
+```
+
+REPL UI 保留完整历史（`includeSnipped: true`），只在 API 路径中过滤。
+
+#### Nudge 机制
+
+```typescript
+// src/utils/attachments.ts:3965-3983
+// 当上下文效率低时，生成 { type: 'context_efficiency' } attachment
+// 注入 SNIP_NUDGE_TEXT 提示 Claude 使用 SnipTool
+export function shouldNudgeForSnips(messages: Message[]): boolean {
+  // 考虑因素（从注释 "resets on prior nudges, snip markers, snip boundaries" 推断）：
+  // - 距上次 nudge 的间隔（避免每轮都提示）
+  // - tool result 数量或 token 使用百分比
+  // - 近期是否已执行过 snip
+}
+```
+
+#### 两种消息类型
+
+| 类型 | 判断函数 | UI 行为 | 用途 |
+|------|---------|---------|------|
+| **snip marker** | `isSnipMarkerMessage`（snipCompact.js） | 隐藏（`return null`） | 内部跟踪，记录 snip 事件 |
+| **snip boundary** | `isSnipBoundaryMessage`（snipProjection.js） | 渲染 `<SnipBoundaryMessage>` | 用户可见的压缩通知 + 携带 `snipMetadata.removedUuids` |
+
+#### 完整数据流
+
+```
+第 N 轮：
+  API 返回 → Claude 调用 SnipTool({ messageIds: ["m8k3f2"] })
+           → SnipTool 标记 uuid-a 为待 snip
+
+第 N+1 轮开始：
+  snipCompactIfNeeded() → 发现有待 snip 消息
+    → removableUuids = {uuid-a}
+    → tokensFreed = 15000
+    → 创建 boundary { snipMetadata: { removedUuids: ["uuid-a"] } }
+    → yield boundaryMessage → 用户看到 "✂ 已压缩 15K tokens"
+    → messagesForQuery = 过滤后的消息
+
+  getMessagesAfterCompactBoundary()
+    → projectSnippedView() → API 只看到过滤后的消息
+
+会话保存：
+  boundary 的 snipMetadata.removedUuids 写入磁盘
+
+会话恢复：
+  applySnipRemovals() 读取 removedUuids → 从消息 map 中删除
+```
+
 ---
 
 ## Layer 2: microcompact（微压缩）
